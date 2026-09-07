@@ -8,6 +8,13 @@ The implementation is split into two preprocessing paths:
 
 <img width="946" height="418" alt="image" src="https://github.com/user-attachments/assets/6b9e42e6-4825-455a-aa42-7465cdd6623f" />
 
+DICOM Pipeline: -
+<img width="1876" height="556" alt="dicom" src="https://github.com/user-attachments/assets/954278a8-c860-4fb5-ac48-f83fd9502586" />
+
+PDF Pipeline: -
+<img width="1888" height="257" alt="image" src="https://github.com/user-attachments/assets/5c27cd86-b972-4030-9b91-75dc000b467a" />
+
+
 ### Psuedocode: -
 ```
 load config + environment variables
