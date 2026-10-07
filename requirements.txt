@@ -1,6 +1,0 @@
-deid==0.4.12
-minio==7.2.20
-pydicom==3.0.2
-pymupdf==1.28.2
-python-dotenv==1.2.2
-PyYAML==6.0.3
