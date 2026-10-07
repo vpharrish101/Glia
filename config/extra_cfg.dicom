@@ -1,7 +1,0 @@
-FORMAT dicom
-
-%header
-
-REMOVE StudyDescription
-REMOVE InstitutionName
-REMOVE InstitutionAddress
