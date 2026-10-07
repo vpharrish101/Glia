@@ -1,0 +1,47 @@
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  train_images: "data/processed/images/train"
+  train_masks: "data/processed/masks/train"
+  val_images: "data/processed/images/val"
+  val_masks: "data/processed/masks/val"
+  metadata: "data/processed/metadata.csv"
+  checkpoints: "data/model_chkpth"
+  predictions: "data/inference_out/predictions"
+  overlays: "data/inference_out/overlays"
+
+preprocessing:
+  modality: "flair"
+  image_size: 256
+  min_tumor_pixels: 10
+  val_split: 0.2
+  normalize: true
+  context_slices: 1          # 2.5D: num adjacent slices per side (1 = 3-channel total)
+
+training:
+  batch_size: 16
+  learning_rate: 0.001
+  epochs: 36
+  num_workers: 4
+  pin_memory: true
+  gradient_accumulation_steps: 2
+  mixed_precision: true
+  save_every: 20
+  seed: 74
+
+model:
+  in_channels: 3              # 2.5D: 2*context_slices + 1
+  out_channels: 1
+  features: [32, 64, 128, 256]
+
+inference:
+  batch_size: 24
+  threshold: 0.5
+  checkpoint: "data/model_chkpth/best.pth"
+
+logging:
+  level: "INFO"
+
+mlflow:
+  experiment_name: "2DSeg"
+  tracking_uri: "./mlruns"
