@@ -8,9 +8,9 @@ logger=get_logger("MetadataStore")
 
 
 class MetadataStore:
-    def __init__(self):
-        self.cfg=load_cfg()
-        db_path=self.cfg["database"]["metadata_path"]
+    def __init__(self, db_path=None):
+        if db_path is None:
+            db_path = load_cfg()["database"]["metadata_path"]
 
         from pathlib import Path
         Path(db_path).parent.mkdir(

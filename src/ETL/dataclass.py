@@ -70,28 +70,31 @@ class BraTS_Dataset(Dataset):
         if meta_csv and Path(meta_csv).exists() and split:
             df=pd.read_csv(meta_csv)
             df_split=df[df["split"]==split]
-            self.image_files=sorted(df_split["image_filename"].tolist())
-            self.mask_files=sorted(df_split["mask_filename"].tolist())
+            self.pairs = list(
+                df_split.sort_values("image_filename")[["image_filename", "mask_filename"]].itertuples(index=False, name=None)
+            )
 
         else:
-            self.image_files=sorted(f.name for f in self.img_dir.glob("*.png"))
-            self.mask_files=sorted(f.name for f in self.mask_dir.glob("*.png"))
-
-        assert len(self.image_files)==len(self.mask_files),(
-            f"Mismatch: {len(self.image_files)} images vs {len(self.mask_files)} masks"
-        )
-        logger.info("Dataset [%s]: %d samples",split or "all",len(self.image_files))
+            images = sorted(self.img_dir.glob("*.png"))
+            self.pairs = [(path.name, f"{path.stem}_mask.png") for path in images]
+            # Older processed datasets can use the image basename for both files.
+            self.pairs = [
+                (image, mask if (self.mask_dir / mask).is_file() else image)
+                for image, mask in self.pairs
+            ]
+        logger.info("Dataset [%s]: %d samples", split or "all", len(self.pairs))
     
     def __len__(self)->int:
-        return len(self.image_files)
+        return len(self.pairs)
 
     def __getitem__(self, 
                     idx: int)->dict:
         
-        img_path=self.img_dir/self.image_files[idx]
-        mask_path=self.mask_dir/self.mask_files[idx]
+        image_name, mask_name = self.pairs[idx]
+        img_path = self.img_dir / image_name
+        mask_path = self.mask_dir / mask_name
 
-        image=cv2.imread(str(img_path),cv2.IMREAD_COLOR)
+        image = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
         mask=cv2.imread(str(mask_path),cv2.IMREAD_GRAYSCALE)
 
         if image is None:
@@ -99,6 +102,8 @@ class BraTS_Dataset(Dataset):
         if mask is None:
             raise FileNotFoundError(f"Mask not found: {mask_path}")
 
+        if image.ndim == 2:
+            image = image[..., None]
         mask=(mask>127).astype(np.float32)
 
         if self.transform:
@@ -117,5 +122,5 @@ class BraTS_Dataset(Dataset):
         return {
             "image": image.float(),
             "mask": mask.float(),
-            "filename": self.image_files[idx],
+            "filename": image_name,
             }

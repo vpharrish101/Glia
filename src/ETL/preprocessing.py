@@ -1,4 +1,3 @@
-import sys
 import logging
 import cv2
 import yaml
@@ -15,7 +14,7 @@ logger=logging.getLogger(__name__)
 def _find_nifti(sub_dir: Path,
                keyword: str)->Path|None:
     
-    for p in sub_dir.glob("*.nii*"):
+    for p in sorted(sub_dir.glob("*.nii*")):
         if keyword in p.name.lower():
             return p
     return None
@@ -30,7 +29,7 @@ def _normalize_slice(s: np.ndarray)->np.ndarray:
     return ((s-min)/(tmp)*255).astype(np.uint8)
 
 
-def _build_ctximg(vol: np.ndarray,
+def build_context_image(vol: np.ndarray,
                   center: int,
                   context: int,
                   img_size: int)-> np.ndarray:
@@ -48,24 +47,38 @@ def _build_ctximg(vol: np.ndarray,
     return np.stack(channels,axis=-1)
 
 
+def context_slices(cfg):
+    channels = cfg["model"]["in_channels"]
+    context = cfg["preprocessing"].get("context_slices", 1)
+    if not isinstance(context, int) or context < 0 or channels != 2 * context + 1:
+        raise ValueError("model.in_channels must equal 2 * preprocessing.context_slices + 1")
+    if cfg["model"]["out_channels"] != 1:
+        raise ValueError("Binary segmentation requires model.out_channels=1")
+    return context
+
+
 def process_subject(sub_dir: Path,
                     img_size: int,
                     min_tumorpix: int,
-                    slice_context: int)->list[dict]:
+                    slice_context: int, modality: str = "flair")->list[dict]:
     
     sub_id=sub_dir.name
-    flair_pth=_find_nifti(sub_dir, "flair")
+    flair_pth=_find_nifti(sub_dir, modality.lower())
     seg_pth=_find_nifti(sub_dir,"seg")
 
     if flair_pth is None:
-        logger.warning(f"No FLAIR file for {sub_id}")
+        logger.warning("No %s file for %s", modality, sub_id)
         return []
     if seg_pth is None:
         logger.warning(f"No segmentation file for {sub_id}")
         return []
     
-    flair_data=ni.load(str(flair_pth)).get_fdata(dtype=np.float32)  # pyright: ignore[reportAttributeAccessIssue]
-    seg_data=(ni.load(str(seg_pth)).get_fdata(dtype=np.float32)>0).astype(np.uint8) # pyright: ignore[reportAttributeAccessIssue]
+    scan = ni.load(flair_pth)
+    segmentation = ni.load(seg_pth)
+    if len(scan.shape) != 3 or scan.shape != segmentation.shape or not np.allclose(scan.affine, segmentation.affine):
+        raise ValueError(f"Image and mask must share a 3D voxel grid for {sub_id}")
+    flair_data = scan.get_fdata(dtype=np.float32)
+    seg_data = (segmentation.get_fdata(dtype=np.float32) > 0).astype(np.uint8)
 
     rec=[]
     for x in range(flair_data.shape[2]):
@@ -74,7 +87,7 @@ def process_subject(sub_dir: Path,
         if tumor_pix<min_tumorpix:
             continue
 
-        context_img=_build_ctximg(flair_data,x,slice_context,img_size)
+        context_img=build_context_image(flair_data,x,slice_context,img_size)
         mask=cv2.resize(seg_data[:,:,x],(img_size,img_size),interpolation=cv2.INTER_NEAREST)
 
         mask=(mask*255).astype(np.uint8)
@@ -99,37 +112,41 @@ def run_etl(config_path: str):
     logging.basicConfig(level=cfg.get("logging",{}).get("level","INFO"))
 
     raw_dir=Path(cfg["paths"]["raw_data"])
-    processed_dir=Path(cfg["paths"]["processed_data"])
+    paths = cfg["paths"]
+    image_dirs = {split: Path(paths[f"{split}_images"]) for split in ("train", "val")}
+    mask_dirs = {split: Path(paths[f"{split}_masks"]) for split in ("train", "val")}
     img_size=cfg["preprocessing"]["image_size"]
     min_tumorpix=cfg["preprocessing"]["min_tumor_pixels"]
     val_split=cfg["preprocessing"]["val_split"]
     seed=cfg["training"]["seed"]
-    context_slices=cfg["preprocessing"].get("context_slices",1)
+    context = context_slices(cfg)
+    if context > 1:
+        raise ValueError("NIfTI PNG preprocessing supports one or three model channels")
+    modality = cfg["preprocessing"].get("modality", "flair")
 
-    for split in ("train","val"):
-        (processed_dir/"images"/split).mkdir(parents=True,exist_ok=True)
-        (processed_dir/"masks"/split).mkdir(parents=True,exist_ok=True)
+    for directory in (*image_dirs.values(), *mask_dirs.values()):
+        directory.mkdir(parents=True, exist_ok=True)
 
     subject_dirs=sorted(p for p in raw_dir.iterdir() if p.is_dir())
 
     if not subject_dirs:
-        logger.error(f"No subject directories found in {raw_dir}")
-        sys.exit(1)
+        raise ValueError(f"No subject directories found in {raw_dir}")
 
     logger.info(f"Found {len(subject_dirs)} subjects in {raw_dir}")
-    logger.info(f"2.5D context: {context_slices} slices per side ({2*context_slices+1} total channels)",)
+    logger.info(f"2.5D context: {context} slices per side ({2*context+1} total channels)",)
 
     all_records=[]
     for subj_dir in tqdm(subject_dirs,desc="Processing subjects"):
-        all_records.extend(process_subject(subj_dir,img_size,min_tumorpix,context_slices))
+        all_records.extend(process_subject(subj_dir, img_size, min_tumorpix, context, modality))
 
     if not all_records:
-        logger.error("No valid slices extracted.")
-        sys.exit(1)
+        raise ValueError("No valid slices extracted")
 
     logger.info(f"Total slices with tumor:{len(all_records)}")
 
-    subject_ids=list({r["subject_id"] for r in all_records})
+    subject_ids = sorted({record["subject_id"] for record in all_records})
+    if len(subject_ids) < 2:
+        raise ValueError("Training needs at least two subjects with usable labeled slices")
     
     train,val=train_test_split(subject_ids,test_size=val_split,random_state=seed)
     train_subjects,val_subjects=set(train), set(val)
@@ -139,11 +156,10 @@ def run_etl(config_path: str):
     metadata_rows=[]
     for rec in tqdm(all_records,desc="Saving slices"):
         split="train" if rec["subject_id"] in train_subjects else "val"
-        img_path=processed_dir/"images"/split/rec["image_filename"]
-        mask_path=processed_dir/"masks"/split/rec["mask_filename"]
-
-        cv2.imwrite(str(img_path),rec["image"])
-        cv2.imwrite(str(mask_path),rec["mask"])
+        img_path = image_dirs[split] / rec["image_filename"]
+        mask_path = mask_dirs[split] / rec["mask_filename"]
+        if not cv2.imwrite(str(img_path), rec["image"]) or not cv2.imwrite(str(mask_path), rec["mask"]):
+            raise OSError(f"Could not write image and mask for {rec['image_filename']}")
 
         metadata_rows.append({
             "subject_id": rec["subject_id"],
@@ -156,7 +172,8 @@ def run_etl(config_path: str):
             "mask_path": str(mask_path),
             })
 
-    metadata_path=processed_dir/"metadata.csv"
+    metadata_path = Path(paths["metadata"])
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
     df=pd.DataFrame(metadata_rows)
     df.to_csv(metadata_path,index=False)
 

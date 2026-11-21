@@ -10,6 +10,11 @@ logger=get_logger("DataLake")
 
 class DataLake:
     def __init__(self):
+        required = ("MINIO_ENDPOINT", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "MINIO_BUCKET")
+        missing = [name for name in required if not os.getenv(name)]
+        if missing:
+            raise ValueError(f"Missing storage settings: {', '.join(missing)}")
+
         self.client=Minio(
             os.getenv("MINIO_ENDPOINT"),
             access_key=os.getenv("MINIO_ROOT_USER"),
@@ -55,3 +60,6 @@ class DataLake:
         )
 
         return object_key
+
+    def get(self, object_key, path):
+        self.client.fget_object(self.bucket, object_key, str(path))

@@ -1,47 +1,34 @@
+import argparse
+from collections import defaultdict
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
-
-from pathlib import Path
-from collections import defaultdict
-
 from src.ETL.Metadata_db import MetadataStore
-from src.ETL.dicom_preprocess import processDICOMBatch
-from src.ETL.utils import load_config
-from src.ETL.pdf_preprocess import sanitize_PDF
 from src.ETL.Object_storage import DataLake
+from src.ETL.dicom_preprocess import processDICOMBatch
+from src.ETL.pdf_preprocess import sanitize_PDF
+from src.ETL.utils import load_config
 from src.ETL.utils.logging_mod import get_logger
 
 
 logger=get_logger("Pipeline")
-cfg=load_config.load_cfg()
 
 
-def _DICOM(meta_store,lake):
+def ingest_dicoms(cfg, meta_store, lake):
     logger.info("Starting DICOM pipeline")
-
-    deid_records=process_DICOM_batch(
-        cfg["Input_dirs"]["DICOM_dir"],
-        lake,)
-
-    meta_store.store_DICOM_metadata(deid_records)
-
-    processed_count=sum(1 for record in deid_records if record["status"]!="error")
-
-    failed_count=sum(
-        1
-        for record in deid_records
-        if record["status"]=="error"
-    )
-
+    records = processDICOMBatch(cfg["Input_dirs"]["DICOM_dir"], lake)
+    meta_store.store_DICOM_metadata(records)
+    failed = sum(record["status"] == "error" for record in records)
     logger.info(
         "DICOM pipeline completed | processed=%d | failed=%d",
-        processed_count,
-        failed_count,
+        len(records) - failed,
+        failed,
     )
+    return records
 
 
-def _PDF(meta_store,lake):
+def _PDF(meta_store, lake, cfg):
     PDF_source_dir=Path(
         cfg["Input_dirs"]["PDF_dir"]
     )
@@ -109,14 +96,22 @@ def _PDF(meta_store,lake):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Run DICOM and PDF ingestion")
+    parser.add_argument("--config", default="config/config.yaml")
+    args = parser.parse_args()
+    load_dotenv()
+    cfg = load_config.load_cfg(args.config)
+
     logger.info("ETL pipeline started")
-    lake=DataLake()
+    lake = DataLake()
+    with MetadataStore(cfg["database"]["metadata_path"]) as meta_store:
+        records = ingest_dicoms(cfg, meta_store, lake)
+        _PDF(meta_store, lake, cfg)
 
-    with MetadataStore() as meta_store:
-        _DICOM(meta_store,lake,)
-        _PDF(meta_store,lake,)
+    if any(record["status"] == "error" for record in records):
+        raise SystemExit("Some DICOM files were rejected. See the ingestion log.")
+    logger.info("ETL pipeline completed")
 
-    logger.info("ETL pipeline completed successfully")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()

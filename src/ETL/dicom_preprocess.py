@@ -1,312 +1,170 @@
-import pydicom
-import tempfile
-import src.ETL.utils.HMAC_builder as HMAC_builder
+"""Prepare single-frame monochrome DICOM images for the data lake."""
 
+from functools import lru_cache
 from pathlib import Path
-from deid.config import DeidRecipe
-from deid.dicom import DicomCleaner
-from deid.dicom import get_identifiers
-from deid.dicom import replace_identifiers
+from tempfile import TemporaryDirectory
 
-from concurrent.futures import ProcessPoolExecutor
+import pydicom
+from deid.config import DeidRecipe
+from deid.dicom.pixels.detect import has_burned_pixels
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, MRImageStorage, UID
+
 from src.ETL.Object_storage import DataLake
+from src.ETL.utils.HMAC_builder import deterministic_uid, patient_hmac
 from src.ETL.utils.logging_mod import get_logger
 
-
-logger=get_logger("DICOM")
-
-
-def sanitize_DICOM(source_file,
-                   uid_registry,
-                   lake,
-                   object_name,):
-
-    source_file=Path(source_file)
-    logger.info("Sanitizing DICOM file: %s",source_file.name,)
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-
-        tmp_dir=Path(tmp_dir)
-        original=pydicom.dcmread(source_file,stop_before_pixels=True,)
-
-        logger.debug("Loaded DICOM metadata: %s",source_file.name,)
-
-        deid_recipe=DeidRecipe(
-            deid=[
-                "config/extra_cfg.dicom",
-                "config/deid.dicom",
-            ]
-        )
-
-        identifiers=get_identifiers(
-            [str(source_file)],
-            expand_sequences=False,
-            )
+logger = get_logger("DICOM")
+SUPPORTED_STORAGE = {MRImageStorage: "MR", CTImageStorage: "CT"}
+PIXEL_RECIPE = Path(__file__).resolve().parents[2] / "config" / "deid.dicom"
+# Keep the numeric image geometry and acquisition fields used by readers.
+# Text, private elements, sequences and overlays are omitted by construction.
+IMAGE_FIELDS = (
+    "SeriesNumber", "InstanceNumber", "ImagePositionPatient",
+    "ImageOrientationPatient", "PixelSpacing", "SliceThickness",
+    "SpacingBetweenSlices", "EchoTime", "EchoNumbers", "RepetitionTime",
+    "InversionTime", "MagneticFieldStrength", "FlipAngle", "EchoTrainLength",
+    "NumberOfAverages", "TemporalPositionIdentifier", "RescaleSlope",
+    "RescaleIntercept", "KVP",
+)
+EMPTY_FIELDS = (
+    "PatientName", "PatientBirthDate", "PatientSex", "StudyDate", "StudyTime",
+    "ReferringPhysicianName", "StudyID", "AccessionNumber", "PositionReferenceIndicator",
+)
 
 
-        for fields in identifiers.values():
-            patient_id=next(
-                (
-                    str(x.element.value)
-                    for x in fields.values()
-                    if x.name=="PatientID"
-                ),
-                None,
-            )
+class RejectedDicom(ValueError):
+    """Input outside the supported DICOM or pixel policy."""
 
-            if patient_id:
-                fields["entity_id"]=HMAC_builder.patient_hmac(
-                    patient_id
-                )
 
-        logger.debug(
-            "Applying DICOM de-identification rules: %s",
-            source_file.name,
-        )
+@lru_cache(maxsize=1)
+def pixel_recipe():
+    return DeidRecipe(str(PIXEL_RECIPE))
 
-        replace_identifiers(
-            dicom_files=[str(source_file)],
-            ids=identifiers,
-            deid=deid_recipe,
-            save=True,
-            output_folder=str(tmp_dir),
-            remove_private=True,
-            strip_sequences=False,
-        )
 
-        deid_file=tmp_dir/source_file.name
-        DICOM=pydicom.dcmread(deid_file)
+def sanitize_DICOM(source):
+    storage_class = source.get("SOPClassUID")
+    modality = SUPPORTED_STORAGE.get(storage_class)
+    if modality is None or source.get("Modality") != modality:
+        raise RejectedDicom("Expected classic MR or CT Image Storage")
+    photometric = source.get("PhotometricInterpretation")
+    if (
+        int(source.get("NumberOfFrames", 1)) != 1
+        or source.get("SamplesPerPixel") != 1
+        or photometric not in {"MONOCHROME1", "MONOCHROME2"}
+        or "PixelData" not in source
+    ):
+        raise RejectedDicom("Expected single-frame monochrome pixel data")
+    if (
+        str(source.get("BurnedInAnnotation", "")).strip().upper() != "NO"
+        or str(source.get("RecognizableVisualFeatures", "")).strip().upper() == "YES"
+    ):
+        raise RejectedDicom("Input must declare BurnedInAnnotation=NO and have no flagged recognizable features")
+    image_type = source.get("ImageType", [])
+    if isinstance(image_type, str) or len(image_type) < 2:
+        raise RejectedDicom("Missing or invalid ImageType")
 
-        
-        if hasattr(original, "StudyInstanceUID"):
-            DICOM.StudyInstanceUID = HMAC_builder.deterministic_uid(
-                str(original.StudyInstanceUID),
-                "study",
-            )
+    patient_id = str(source.get("PatientID", "")).strip()
+    if not patient_id:
+        raise RejectedDicom("Missing PatientID")
+    uid_fields = {
+        "StudyInstanceUID": "study",
+        "SeriesInstanceUID": "series",
+        "SOPInstanceUID": "sop",
+        "FrameOfReferenceUID": "frame",
+    }
+    mapped = {}
+    for field, namespace in uid_fields.items():
+        value = UID(str(source.get(field, "")))
+        if value.is_valid:
+            mapped[field] = deterministic_uid(value, namespace)
+        elif field != "FrameOfReferenceUID" or value:
+            raise RejectedDicom(f"Missing or invalid {field}")
 
-        if hasattr(original, "SeriesInstanceUID"):
-            DICOM.SeriesInstanceUID = HMAC_builder.deterministic_uid(
-                str(original.SeriesInstanceUID),
-                "series",
-            )
+    result = has_burned_pixels(source, force=False, deid=pixel_recipe())
+    if any(hit["group"] in {"blacklist", "graylist"} for hit in result["results"]):
+        raise RejectedDicom("Pixel rules flagged the image for review")
 
-        if hasattr(original, "SOPInstanceUID"):
-            new_sop_uid = HMAC_builder.deterministic_uid(
-                str(original.SOPInstanceUID),
-                "sop",
-            )
+    file_meta = FileMetaDataset()
+    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    file_meta.MediaStorageSOPClassUID = storage_class
+    file_meta.MediaStorageSOPInstanceUID = mapped["SOPInstanceUID"]
+    clean = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
+    clean.SOPClassUID = storage_class
+    clean.Modality = modality
+    for field, value in mapped.items():
+        setattr(clean, field, value)
+    for field in IMAGE_FIELDS:
+        if field in source:
+            clean.add(source[field])
+    for field in EMPTY_FIELDS:
+        setattr(clean, field, "")
+    clean.ImageType = [
+        "ORIGINAL" if image_type[0] == "ORIGINAL" else "DERIVED",
+        "PRIMARY" if image_type[1] == "PRIMARY" else "SECONDARY",
+    ]
+    clean.PatientID = patient_hmac(patient_id)
+    clean.PatientIdentityRemoved = "YES"
+    clean.DeidentificationMethod = "Glia metadata allowlist and UID pseudonymization"
+    clean.BurnedInAnnotation = "NO"
+    clean.set_pixel_data(source.pixel_array, photometric, source.BitsStored, generate_instance_uid=False)
+    return clean
 
-            DICOM.SOPInstanceUID = new_sop_uid
 
-            if hasattr(DICOM, "file_meta"):
-                DICOM.file_meta.MediaStorageSOPInstanceUID = new_sop_uid
-
-        if hasattr(original, "FrameOfReferenceUID"):
-            DICOM.FrameOfReferenceUID = HMAC_builder.deterministic_uid(
-                str(original.FrameOfReferenceUID),
-                "frame",
-            )
-
-        DICOM.save_as(deid_file)
-
-        logger.debug("DICOM UIDs regenerated: %s",source_file.name,)
-        pixel_cleaner=DicomCleaner(deid="config/deid.dicom")
-        pixel_scan=pixel_cleaner.detect(str(deid_file))
-        pixel_status="gtg"
-        pixel_reason="no pixel filter matched"
-
-        if pixel_scan["flagged"]:
-            pixel_results=pixel_scan["results"]
-
-            cleanable_pixels=[
-                item
-                for item in pixel_results
-                if item["group"]=="graylist"
-                and item["coordinates"]
-            ]
-
-            whitelist_hits=[
-                item
-                for item in pixel_results
-                if item["group"]=="whitelist"
-            ]
-
-            blacklist_hits=[
-                item
-                for item in pixel_results
-                if item["group"]=="blacklist"
-            ]
-
-            graylist_hits=[
-                item
-                for item in pixel_results
-                if item["group"]=="graylist"
-            ]
-
-            if cleanable_pixels:
-                pixel_cleaner.clean()
-
-                pixel_cleaner.save_dicom(output_folder=str(tmp_dir))
-
-                cleaned_file=(tmp_dir/f"cleaned-{deid_file.name}")
-
-                if cleaned_file.exists():
-                    deid_file.unlink()
-                    cleaned_file.rename(deid_file)
-
-                pixel_status="graylist_cleaned"
-                pixel_reason="; ".join(
-                    item["reason"]
-                    for item in cleanable_pixels
-                )
-
-                logger.warning("Pixel data cleaned for DICOM: %s",source_file.name,)
-
-            elif whitelist_hits:
-                pixel_status="whitelist"
-                pixel_reason="; ".join(
-                    item["reason"]
-                    for item in whitelist_hits
-                )
-
-                logger.info(
-                    "Pixel rule matched whitelist: %s",
-                    source_file.name,
-                )
-
-            elif blacklist_hits:
-                pixel_status="blacklist"
-                pixel_reason="; ".join(
-                    item["reason"]
-                    for item in blacklist_hits
-                )
-
-                logger.error(
-                    "Pixel rule matched blacklist: %s",
-                    source_file.name,
-                )
-
-            elif graylist_hits:
-                pixel_status="graylist_review"
-                pixel_reason="; ".join(
-                    item["reason"]
-                    for item in graylist_hits
-                )
-
-                logger.warning(
-                    "DICOM requires pixel review: %s",
-                    source_file.name,
-                )
-
-        lake_key=lake.put(deid_file,f"dicom/{object_name}",)
-        logger.info("DICOM stored in data lake: %s",lake_key,)
-
-        return {
-            "filename":object_name,
-            "patient_id":str(DICOM.PatientID),
-            "status":pixel_status,
-            "reason":pixel_reason,
-            "storage_key":lake_key,
-            "modality":getattr(DICOM,"Modality",None),
-            "study_uid":getattr(DICOM,"StudyInstanceUID",None),
-            "series_uid":getattr(DICOM,"SeriesInstanceUID",None),
-            "sop_uid":getattr(DICOM,"SOPInstanceUID",None),
-            "manufacturer":getattr(DICOM,"Manufacturer",None),
-            "manufacturer_model":getattr(
-                DICOM,
-                "ManufacturerModelName",
-                None,
-            ),
-            "body_part":getattr(DICOM,"BodyPartExamined",None),
-            "rows":getattr(DICOM,"Rows",None),
-            "columns":getattr(DICOM,"Columns",None),
-            "pixel_spacing":str(
-                getattr(
-                    DICOM,
-                    "PixelSpacing",
-                    None,
-                )
-            ),
-            "slice_thickness":str(
-                getattr(
-                    DICOM,
-                    "SliceThickness",
-                    None,
-                )
-            ),
-            "patient_sex":getattr(DICOM,"PatientSex",None),
-            "patient_age":getattr(DICOM,"PatientAge",None),
-            "processing_status":"success",
-        }
-
-def processDICOM(source_file):
-    lake=DataLake()
-
+def processDICOM(source_file, lake=None, seen_sops=None):
     try:
-        DICOM=pydicom.dcmread(
-            source_file,
-            stop_before_pixels=True,
-        )
-
-        original_patient_id=getattr(DICOM,"PatientID",None)
-
-        if original_patient_id is None:
-            raise ValueError("Missing PatientID")
-
-        patient_id=HMAC_builder.patient_hmac(
-            str(original_patient_id)
-        )
-
-        original_sop_uid=str(DICOM.SOPInstanceUID)
-
-        object_name=(
-            f"{patient_id}_"
-            f"{HMAC_builder.deterministic_uid(original_sop_uid,'sop')}.dcm"
-        )
-
-        return sanitize_DICOM(
-            source_file,
-            {},
-            lake,
-            object_name,
-        )
-
-    except Exception as error:
-        logger.exception(
-            "DICOM processing failed: %s",
-            Path(source_file).name,
-        )
+        clean = sanitize_DICOM(pydicom.dcmread(source_file))
+        sop_uid = clean.SOPInstanceUID
+        if seen_sops is not None and sop_uid in seen_sops:
+            raise RejectedDicom("Duplicate SOPInstanceUID in this batch")
+        if lake is None:
+            lake = DataLake()
+        object_name = f"{clean.PatientID}_{sop_uid}.dcm"
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / object_name
+            clean.save_as(path, enforce_file_format=True)
+            storage_key = lake.put(path, f"dicom/{object_name}")
+        if seen_sops is not None:
+            seen_sops.add(sop_uid)
 
         return {
-            "filename":"",
-            "patient_id":"",
-            "status":"error",
-            "reason":str(error),
+            "filename": object_name,
+            "patient_id": clean.PatientID,
+            "status": "pixel_policy_passed",
+            "storage_key": storage_key,
+            "modality": clean.Modality,
+            "study_uid": clean.StudyInstanceUID,
+            "series_uid": clean.SeriesInstanceUID,
+            "sop_uid": clean.SOPInstanceUID,
+            "manufacturer": None,
+            "manufacturer_model": None,
+            "body_part": None,
+            "rows": clean.Rows,
+            "columns": clean.Columns,
+            "pixel_spacing": str(clean.get("PixelSpacing", "")),
+            "slice_thickness": str(clean.get("SliceThickness", "")),
+            "patient_sex": None,
+            "patient_age": None,
+            "processing_status": "success",
         }
+    except RejectedDicom as error:
+        return {"status": "error", "reason": str(error)}
+    except Exception as error:
+        # Library exceptions may contain identifying filenames or tag values.
+        return {"status": "error", "reason": f"DICOM read, decode or storage failed ({type(error).__name__})"}
 
-def processDICOMBatch(source_dir,lake):
-    source_dir=Path(source_dir)
 
-    logger.info("Starting DICOM batch: %s",source_dir)
-
-    DICOM_files=sorted(source_dir.rglob("*.dcm"))
-
-    logger.info(
-        "DICOM files discovered: %d",
-        len(DICOM_files),
+def processDICOMBatch(source_dir, lake):
+    paths = sorted(
+        path for path in Path(source_dir).rglob("*")
+        if path.is_file() and path.suffix.lower() in {".dcm", ".dicom"}
     )
-
-    with ProcessPoolExecutor(max_workers=4) as executor:
-        deid_records=list(
-            executor.map(
-                processDICOM,
-                DICOM_files,
-            )
-        )
-
-    logger.info(
-        "DICOM batch completed: processed=%d",
-        len(deid_records),
-    )
-
-    return deid_records
+    logger.info("DICOM files discovered: %d", len(paths))
+    records = []
+    seen_sops = set()
+    for index, path in enumerate(paths, start=1):
+        record = processDICOM(path, lake, seen_sops)
+        if record["status"] == "error":
+            logger.warning("DICOM input %d rejected: %s", index, record["reason"])
+        records.append(record)
+    return records

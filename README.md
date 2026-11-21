@@ -2,7 +2,7 @@
 
 **What it is:** An end-to-end medical imaging pipeline combining a healthcare ETL system with a medical image segmentation pipeline.
 
-**What it does:** Glia takes medical imaging data through two main stages: first, it processes and de-identifies DICOM/PDF data and stores the resulting files and metadata; then, it prepares medical images for training, trains a U-Net segmentation model, and evaluates its predictions.
+**What it does:** Glia ingests DICOM/PDF data into object storage and records metadata in SQLite. It trains and evaluates a U-Net on labeled NIfTI volumes. For DICOM inference, Glia ingests raw MR slices, retrieves the sanitized images from object storage, and runs a trained checkpoint on them.
 
 **What's unique:** The project connects the data-processing side and the ML side instead of treating them as two separate projects. The ETL layer deals with the clinical data itself, while the ML layer works on the resulting medical imaging data.
 
@@ -71,7 +71,7 @@ MinIO stores the medical imaging objects, while SQLite stores the metadata neede
 <img width="1456" height="287" alt="image" src="https://github.com/user-attachments/assets/18a2345f-fd25-44a6-9427-7d385f72ec0e" />
 
 
-The ML pipeline is therefore concerned with the prepared imaging data rather than the original patient records.
+DICOM inference builds the same neighboring-slice representation used for NIfTI training. It orders stored slices by patient-space position within each series and keeps patient identifiers out of prediction filenames.
 
 ---
 
@@ -120,19 +120,60 @@ The main reason for this structure is practical: preprocessing and data handling
 
 ---
 
-## Deployment: -
+## Installation
 
-### With Docker
+Use Python 3.12 from the repository root.
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+For CPU-only Linux x86-64, pass `--extra-index-url https://download.pytorch.org/whl/cpu 'torch==2.7.0+cpu' 'torchvision==0.22.0+cpu'` to the install command. The Docker image uses these CPU wheels.
+
+## Train on labeled NIfTI
+
+Put at least two subject directories under `data/raw`, with a FLAIR image and a corresponding segmentation volume on the same voxel grid in each directory. Filenames must contain `flair` and `seg` respectively. Configure paths and settings in `config.yaml`.
+
+```bash
+python -m src.main train --config config.yaml
+```
+
+Training writes the best checkpoint to `inference.checkpoint`, runs validation inference, and reports Dice and IoU. Running `python -m src.main` also selects this workflow.
+
+## Run DICOM inference
+
+1. Set `HMAC_SECRET`, `MINIO_ENDPOINT`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, and `MINIO_BUCKET` in the environment or a local `.env`. `MINIO_ENDPOINT` is the host and port of a reachable S3-compatible server. Keep the HMAC secret stable across runs that need to link the same studies.
+2. Put `.dcm` or `.dicom` files under `Input_dirs.DICOM_dir` in `config/config.yaml` (`data/DICOMs` by default). Submit classic, single-frame monochrome MR series compatible with the checkpoint. Multi-slice series need consistent geometry and unique, regularly spaced slice positions. Provide only the sequences the model expects, such as the FLAIR series for a FLAIR model.
+3. Set `inference.checkpoint` to an existing compatible U-Net checkpoint in `config.yaml`. The model configuration, native image orientation, slice order, and preprocessing must match the assumptions used to train that checkpoint. This workflow uses the source image axes and performs no atlas registration.
+
+```bash
+python -m src.main dicom --config config.yaml --etl-config config/config.yaml
+```
+
+The DICOM command ingests the current batch, records accepted objects in SQLite, and reads those sanitized objects back for inference. A rejected input stops prediction for the batch. Accepted objects can still be present in storage. Each series is handled independently. Under `paths.predictions` and `paths.overlays`, the command writes PNGs on the model's resized grid and a `dicom_predictions.csv` manifest that maps them to pseudonymous study, series, and SOP instance UIDs. DICOM inference needs no segmentation labels. Dice and IoU require labeled validation data.
+
+The DICOM metadata allowlist removes free text and private elements and pseudonymizes identifiers. The pixel policy requires `BurnedInAnnotation=NO` and rejects images flagged by the project rules. It does not detect all burned-in text or recognizable anatomy. Verify those before submitting clinical data. The synthetic tests verify pipeline behavior and do not establish clinical de-identification or model accuracy.
+
+To ingest DICOMs and PDFs without segmentation, run `python -m src.ETL.main --config config/config.yaml`. Standalone DICOM ingestion also accepts classic single-frame monochrome CT.
+
+### Docker Compose
+
+Set the secret and storage variables in `.env`, place the DICOM inputs and model checkpoint under the mounted `data/` directory, then run:
 
 ```bash
 docker compose up --build
 ```
 
-### Manual Setup
+Compose runs DICOM inference using its MinIO service. If a trusted network proxy intercepts package downloads during a standalone image build, provide the trusted CA bundle using `docker build --secret id=pip_ca,src=/path/to/ca-bundle.pem -t glia .`.
+
+### Synthetic integration test
+
+With a local test S3-compatible server and its `MINIO_ENDPOINT`, `MINIO_ROOT_USER`, and `MINIO_ROOT_PASSWORD` exported, run:
 
 ```bash
-python -m venv .venv
-pip install -r requirements.txt
+GLIA_TEST_S3=1 python -m unittest discover -s tests -v
 ```
 
-
+The test uses a temporary bucket. It trains one epoch on labeled NIfTI phantoms, encodes equivalent image arrays as DICOM, and checks that predictions agree after sanitization, storage, and retrieval.

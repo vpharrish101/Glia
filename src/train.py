@@ -1,5 +1,4 @@
-import os
-import argparse
+from pathlib import Path
 import yaml
 import logging
 import random
@@ -19,7 +18,8 @@ from src.utils.metrics import dice_coefficient,iou_score
 logger=logging.getLogger(__name__)
 
 def load_config(p):
-    return yaml.safe_load(open(p))
+    with open(p) as stream:
+        return yaml.safe_load(stream)
 
 def set_seed(s):
     random.seed(s);np.random.seed(s);torch.manual_seed(s)
@@ -29,10 +29,14 @@ def set_seed(s):
         torch.backends.cudnn.benchmark=True
 
 def flat(d,p="",sep="."):
-    return {f"{p}{sep}{k}" if p else k: v
-            for k,val in d.items()
-            for v in (flat(val,f"{p}{sep}{k}" if p else k).items()
-                      if isinstance(val,dict) else [(k,val)])}
+    result = {}
+    for key, value in d.items():
+        name = f"{p}{sep}{key}" if p else key
+        if isinstance(value, dict):
+            result.update(flat(value, name, sep))
+        else:
+            result[name] = value
+    return result
 
 
 dice=smp.losses.DiceLoss(mode="binary",from_logits=True)
@@ -64,13 +68,13 @@ def run_epoch(model,
         x=batch["image"].to(device,non_blocking=True)
         y=batch["mask"].to(device,non_blocking=True)
 
-        with torch.amp.autocast("cuda",enabled=use_amp): # pyright: ignore[reportAttributeAccessIssue]
-            out=model(x)
-            loss=criterion(out,y)
+        with torch.set_grad_enabled(train), torch.amp.autocast("cuda", enabled=use_amp):
+            out = model(x)
+            loss = criterion(out, y)
 
         if train:
-            loss=loss/acc_steps
-            scaler.scale(loss).backward() # pyright: ignore[reportOptionalMemberAccess]
+            group_size = min(acc_steps, len(loader) - (i // acc_steps) * acc_steps)
+            scaler.scale(loss / group_size).backward() # pyright: ignore[reportOptionalMemberAccess]
 
             if (i+1)%acc_steps==0 or (i+1)==len(loader):
                 scaler.step(optimizer) # pyright: ignore[reportOptionalMemberAccess]
@@ -96,7 +100,12 @@ def train(config_path: str):
     logger.info(f"Device: {device}")
 
     tr,pp,mp,paths=cfg["training"],cfg["preprocessing"],cfg["model"],cfg["paths"]
-    os.makedirs(paths["checkpoints"],exist_ok=True)
+    checkpoint_path = Path(cfg.get("inference", {}).get("checkpoint") or Path(paths["checkpoints"]) / "best.pth")
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    use_amp = device.type == "cuda" and tr["mixed_precision"]
+    pin_memory = device.type == "cuda" and tr["pin_memory"]
+    if tr["epochs"] < 1 or tr["gradient_accumulation_steps"] < 1:
+        raise ValueError("Training needs at least one epoch and a positive gradient accumulation interval")
 
     train_ds=BraTS_Dataset(paths["train_images"],
                            paths["train_masks"],
@@ -108,20 +117,22 @@ def train(config_path: str):
                          val_trf(pp["image_size"],mp["in_channels"]),
                          paths["metadata"],"val")
 
-    train_loader=DataLoader(train_ds,tr["batch_size"],True,num_workers=tr["num_workers"],pin_memory=tr["pin_memory"],drop_last=True)
-    val_loader=DataLoader(val_ds,tr["batch_size"],False,num_workers=tr["num_workers"],pin_memory=tr["pin_memory"])
+    if not len(train_ds) or not len(val_ds):
+        raise ValueError("Training and validation each need labeled slices")
+    train_loader = DataLoader(train_ds, tr["batch_size"], True, num_workers=tr["num_workers"], pin_memory=pin_memory)
+    val_loader = DataLoader(val_ds, tr["batch_size"], False, num_workers=tr["num_workers"], pin_memory=pin_memory)
 
     model=UNet(mp["in_channels"],mp["out_channels"],mp["features"]).to(device)
     logger.info(f"Params: {count_parameters(model):,}")
 
     optimizer=torch.optim.Adam(model.parameters(),lr=tr["learning_rate"],weight_decay=1e-5)  # pyright: ignore[reportPrivateImportUsage]
     scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode="max",factor=0.5,patience=5)
-    scaler=torch.amp.GradScaler("cuda",enabled=tr["mixed_precision"]) # pyright: ignore[reportAttributeAccessIssue]
+    scaler=torch.amp.GradScaler("cuda",enabled=use_amp) # pyright: ignore[reportAttributeAccessIssue]
 
     mlflow.set_tracking_uri(cfg.get("mlflow",{}).get("tracking_uri","./mlruns"))
     mlflow.set_experiment(cfg.get("mlflow",{}).get("experiment_name","brats"))
 
-    best_dice=0.0
+    best_dice = float("-inf")
     
     with mlflow.start_run():
         mlflow.log_params(flat(cfg))
@@ -129,8 +140,8 @@ def train(config_path: str):
         for epoch in range(1,tr["epochs"]+1):
             t0=time.time()
 
-            trn=run_epoch(model,train_loader,device,tr["mixed_precision"],optimizer,scaler,tr["gradient_accumulation_steps"])
-            val=run_epoch(model,val_loader,device,tr["mixed_precision"])
+            trn=run_epoch(model,train_loader,device,use_amp,optimizer,scaler,tr["gradient_accumulation_steps"])
+            val=run_epoch(model,val_loader,device,use_amp)
 
             scheduler.step(val["dice"])
             print(
@@ -154,7 +165,7 @@ def train(config_path: str):
                     "optimizer_state_dict": optimizer.state_dict(),
                     "best_dice": best_dice,}
                 
-                torch.save(checkpoint,os.path.join(paths["checkpoints"],"best.pth"))
+                torch.save(checkpoint, checkpoint_path)
 
         mlflow.log_metric("best_val_dice",best_dice)
         logger.info(f"Best Dice: {best_dice:.4f}")
