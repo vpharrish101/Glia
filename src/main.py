@@ -14,7 +14,7 @@ logger = logging.getLogger("Glia")
 def main():
     parser = argparse.ArgumentParser(description="Glia DICOM segmentation")
     parser.add_argument("mode", choices=("train", "inference"))
-    parser.add_argument("--config", default="config.yaml", help="Pipeline configuration")
+    parser.add_argument("--config", default="config/config.yaml", help="Pipeline configuration")
     args = parser.parse_args()
     load_dotenv()
     cfg = yaml.safe_load(Path(args.config).read_text())

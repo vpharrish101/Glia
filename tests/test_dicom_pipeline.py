@@ -131,7 +131,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
                 return result.stdout + result.stderr
 
-            cfg = yaml.safe_load((ROOT / "config.yaml").read_text())
+            cfg = yaml.safe_load((ROOT / "config" / "config.yaml").read_text())
             cfg["preprocessing"]["image_size"] = 32
             cfg["training"].update(epochs=1, batch_size=16, learning_rate=0.0001, num_workers=0)
             cfg["etl"]["num_workers"] = 2
@@ -141,7 +141,8 @@ class PipelineTests(unittest.TestCase):
                 dicom="incoming/dicom", masks="annotations", metadata_db="metadata/index.db",
                 predictions="dicom/predictions", overlays="dicom/overlays",
             )
-            config = work / "config.yaml"
+            config = work / "config" / "config.yaml"
+            config.parent.mkdir()
             config.write_text(yaml.safe_dump(cfg))
 
             # Two patients are required for a patient-level validation split.

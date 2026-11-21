@@ -48,7 +48,6 @@ services:
       - ./data:/app/data
       - ./output:/app/output
       - ./config:/app/config:ro
-      - ./config.yaml:/app/config.yaml:ro
       - ./mlruns:/app/mlruns
 
 volumes:

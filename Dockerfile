@@ -11,6 +11,5 @@ RUN --mount=type=secret,id=pip_ca \
 
 COPY src ./src
 COPY config ./config
-COPY config.yaml .
 
 CMD ["python","-m","src.main","inference"]
