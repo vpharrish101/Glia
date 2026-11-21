@@ -182,7 +182,8 @@ class PipelineTests(unittest.TestCase):
 
             # Inference reads the same input layout without labels.
             labels.rename(work / "unused-labels")
-            self.assertNotIn("V-Dice", run("inference"))
+            inference_config = config.rename(work / "inference.yaml")
+            self.assertNotIn("V-Dice", run("inference", "--config", str(inference_config)))
             with (work / "dicom/predictions/dicom_predictions.csv").open() as stream:
                 report = list(csv.DictReader(stream))
             self.assertEqual(len(report), 7)
@@ -211,7 +212,7 @@ class PipelineTests(unittest.TestCase):
 
             images[0].save_as(raw / "first/duplicate.dcm", enforce_file_format=True)
             cfg["paths"]["predictions"] = "rejected/predictions"
-            config.write_text(yaml.safe_dump(cfg))
-            log = run("inference", expected_status=1)
+            inference_config.write_text(yaml.safe_dump(cfg))
+            log = run("inference", "--config", str(inference_config), expected_status=1)
             self.assertIn("Duplicate SOPInstanceUID", log)
             self.assertFalse((work / cfg["paths"]["predictions"]).exists())

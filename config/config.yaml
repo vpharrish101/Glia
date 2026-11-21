@@ -1,5 +1,0 @@
-Input_dirs:
-  DICOM_dir: "data/DICOMs"
-
-database:
-  metadata_path: "output/metadata.db"

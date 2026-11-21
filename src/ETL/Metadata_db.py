@@ -1,6 +1,6 @@
 import sqlite3
+from pathlib import Path
 
-from src.ETL.utils.load_config import load_cfg
 from src.ETL.utils.logging_mod import get_logger
 
 
@@ -8,11 +8,7 @@ logger=get_logger("MetadataStore")
 
 
 class MetadataStore:
-    def __init__(self, db_path=None):
-        if db_path is None:
-            db_path = load_cfg()["database"]["metadata_path"]
-
-        from pathlib import Path
+    def __init__(self, db_path):
         Path(db_path).parent.mkdir(
             parents=True,
             exist_ok=True,

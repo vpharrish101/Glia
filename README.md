@@ -34,7 +34,7 @@ docker compose run --rm pipeline inference
 
 **Train** writes the best checkpoint to `data/model_chkpth/best.pth` and reports Dice and IoU on a patient-level validation split. **Inference** loads that checkpoint and writes masks, overlays, and `dicom_predictions.csv` under `data/inference_out/`. The CSV maps each PNG to its sanitized DICOM slice. Both commands save sanitized DICOMs in the configured bucket and metadata in `output/metadata.db`.
 
-Edit `config.yaml` for input and output paths, batch sizes, ETL and data-loading workers, and model and training settings. `training.learning_rate` is the optimizer update size, such as `0.0001`. `training.gradient_accumulation_steps` is the number of batches per update, such as `2`.
+Both commands read the root `config.yaml` for input and output paths, ETL and data-loading workers, and model and training settings. Pass `--config` to use a different complete settings file. `training.learning_rate` is the optimizer update size, such as `0.0001`. `training.gradient_accumulation_steps` is the number of batches per update, such as `2`.
 
 ## Synthetic test
 
