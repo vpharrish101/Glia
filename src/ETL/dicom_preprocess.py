@@ -155,8 +155,9 @@ def processDICOM(source_file, lake=None, seen_sops=None):
 
 
 def processDICOMBatch(source_dir, lake):
+    source_dir = Path(source_dir)
     paths = sorted(
-        path for path in Path(source_dir).rglob("*")
+        path for path in source_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in {".dcm", ".dicom"}
     )
     logger.info("DICOM files discovered: %d", len(paths))
@@ -166,5 +167,8 @@ def processDICOMBatch(source_dir, lake):
         record = processDICOM(path, lake, seen_sops)
         if record["status"] == "error":
             logger.warning("DICOM input %d rejected: %s", index, record["reason"])
+        else:
+            # Keep the source path in memory only so the caller can match input labels.
+            record["source_path"] = path.relative_to(source_dir)
         records.append(record)
     return records

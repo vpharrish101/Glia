@@ -1,4 +1,6 @@
-"""Read sanitized DICOM objects as ordered 2.5D segmentation inputs."""
+"""Read sanitized DICOM objects in physical slice order."""
+
+from collections import defaultdict
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -6,10 +8,6 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import pydicom
 from pydicom.pixels import apply_modality_lut
-from torch.utils.data import Dataset
-
-from src.ETL.dataclass import val_trf
-from src.ETL.preprocessing import build_context_image
 
 
 def _geometry_vector(image, field, size):
@@ -60,43 +58,41 @@ def order_slices(images):
     return [image for _, image in positions]
 
 
-class DicomDataset(Dataset):
-    def __init__(self, lake, records, image_size, context_slices):
-        images = []
-        with TemporaryDirectory() as directory:
-            path = Path(directory) / "slice.dcm"
-            for record in records:
-                lake.get(record["storage_key"], path)
-                image = pydicom.dcmread(path)
-                tags = (image.PatientID, image.StudyInstanceUID, image.SeriesInstanceUID, image.SOPInstanceUID)
-                expected = tuple(record[key] for key in ("patient_id", "study_uid", "series_uid", "sop_uid"))
-                if image.PatientIdentityRemoved != "YES" or tags != expected:
-                    raise ValueError("Stored DICOM does not match the sanitized ingestion record")
-                images.append(image)
-                path.unlink()
+def read_series(lake, records):
+    """Yield each pixel volume and its sanitized records in matching slice order."""
+    groups = defaultdict(list)
+    for record in records:
+        key = (record["patient_id"], record["study_uid"], record["series_uid"])
+        groups[key].append(record)
 
-        ordered = order_slices(images)
-        slices = []
-        for image in ordered:
-            pixels = apply_modality_lut(image.pixel_array, image).astype(np.float32)
-            if not np.isfinite(pixels).all():
-                raise ValueError(f"Invalid pixel values in slice {image.SOPInstanceUID}")
-            if image.PhotometricInterpretation == "MONOCHROME1":
-                pixels = -pixels
-            slices.append(pixels)
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "slice.dcm"
+        for _, entries in sorted(groups.items()):
+            yield _read_volume(lake, path, entries)
 
-        self.volume = np.stack(slices, axis=-1)
-        self.sop_uids = [image.SOPInstanceUID for image in ordered]
-        self.image_size = image_size
-        self.context_slices = context_slices
-        self.transform = val_trf(image_size, 2 * context_slices + 1)
 
-    def __len__(self):
-        return len(self.sop_uids)
+def _read_volume(lake, path, records):
+    images = []
+    by_uid = {}
+    for record in records:
+        lake.get(record["storage_key"], path)
+        image = pydicom.dcmread(path)
+        path.unlink()
+        tags = (image.PatientID, image.StudyInstanceUID, image.SeriesInstanceUID, image.SOPInstanceUID)
+        expected = tuple(record[key] for key in ("patient_id", "study_uid", "series_uid", "sop_uid"))
+        if image.PatientIdentityRemoved != "YES" or tags != expected:
+            raise ValueError("Stored DICOM does not match the sanitized ingestion record")
+        images.append(image)
+        by_uid[image.SOPInstanceUID] = record
 
-    def __getitem__(self, index):
-        image = build_context_image(self.volume, index, self.context_slices, self.image_size)
-        return {
-            "image": self.transform(image=image)["image"].float(),
-            "filename": f"{self.sop_uids[index]}.png",
-        }
+    slices = []
+    ordered = order_slices(images)
+    for image in ordered:
+        pixels = apply_modality_lut(image.pixel_array, image).astype(np.float32)
+        if not np.isfinite(pixels).all():
+            raise ValueError(f"Invalid pixel values in slice {image.SOPInstanceUID}")
+        if image.PhotometricInterpretation == "MONOCHROME1":
+            pixels = -pixels
+        slices.append(pixels)
+
+    return np.stack(slices, axis=-1), [by_uid[image.SOPInstanceUID] for image in ordered]

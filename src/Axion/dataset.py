@@ -1,0 +1,94 @@
+"""Prepare ordered image stacks for binary segmentation."""
+
+from dataclasses import dataclass
+
+import albumentations as A
+import cv2
+import numpy as np
+from albumentations.pytorch import ToTensorV2
+from torch.utils.data import Dataset
+
+
+@dataclass(frozen=True)
+class Scan:
+    patient_id: str
+    slice_ids: list[str]
+    images: np.ndarray  # height, width, slices
+    masks: np.ndarray | None = None
+
+
+def prepare_scan(patient_id, slice_ids, images, image_size, mask_paths=None):
+    target_size = (image_size, image_size)
+    masks = None
+    if mask_paths is not None:
+        mask_slices = []
+        for slice_id, path in zip(slice_ids, mask_paths, strict=True):
+            if not path.is_file():
+                raise ValueError(f"Missing PNG mask for slice {slice_id}")
+            mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if mask is None or mask.shape != images.shape[:2]:
+                raise ValueError(f"Mask for slice {slice_id} must be grayscale and match the DICOM pixel grid")
+            mask_slices.append(cv2.resize((mask > 0).astype(np.uint8), target_size, interpolation=cv2.INTER_NEAREST))
+        masks = np.stack(mask_slices, axis=-1)
+
+    image_slices = []
+    for index in range(images.shape[2]):
+        image = images[:, :, index]
+        low, high = image.min(), image.max()
+        if high - low < 1e-8:
+            image = np.zeros_like(image, dtype=np.uint8)
+        else:
+            image = ((image - low) / (high - low) * 255).astype(np.uint8)
+        image_slices.append(cv2.resize(image, target_size, interpolation=cv2.INTER_LINEAR))
+    return Scan(patient_id, slice_ids, np.stack(image_slices, axis=-1), masks)
+
+
+class SliceDataset(Dataset):
+    def __init__(self, scans, cfg, augment=False):
+        self.context = cfg["preprocessing"].get("context_slices", 1)
+        channels = cfg["model"]["in_channels"]
+        if not isinstance(self.context, int) or self.context < 0 or channels != 2 * self.context + 1:
+            raise ValueError("model.in_channels must equal 2 * preprocessing.context_slices + 1")
+        if cfg["model"]["out_channels"] != 1:
+            raise ValueError("Binary segmentation requires model.out_channels=1")
+
+        transforms = []
+        if augment:
+            transforms.extend([
+                A.HorizontalFlip(p=0.474),
+                A.VerticalFlip(p=0.645),
+                A.RandomRotate90(p=0.5),
+                A.ShiftScaleRotate(
+                    shift_limit=0.05, scale_limit=0.1, rotate_limit=15,
+                    border_mode=cv2.BORDER_CONSTANT, p=0.5,
+                ),
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+                A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+            ])
+        self.transform = A.Compose([
+            *transforms,
+            A.Normalize(mean=(0.0,) * channels, std=(1.0,) * channels),
+            ToTensorV2(),
+        ])
+        self.samples = [(scan, index) for scan in scans for index in range(len(scan.slice_ids))]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        scan, center = self.samples[index]
+        blank = np.zeros(scan.images.shape[:2], dtype=np.uint8)
+        channels = [
+            scan.images[:, :, neighbor] if 0 <= neighbor < len(scan.slice_ids) else blank
+            for neighbor in range(center - self.context, center + self.context + 1)
+        ]
+        image = np.stack(channels, axis=-1)
+        inputs = {"image": image}
+        if scan.masks is not None:
+            inputs["mask"] = scan.masks[:, :, center]
+        sample = self.transform(**inputs)
+        sample["image"] = sample["image"].float()
+        if "mask" in sample:
+            sample["mask"] = sample["mask"].unsqueeze(0).float()
+        sample["slice_id"] = scan.slice_ids[center]
+        return sample

@@ -26,7 +26,6 @@ class MetadataStore:
         )
 
         self._init_DICOM()
-        self._init_PDF()
 
     def _init_DICOM(self):
         self.sqlite.execute("""
@@ -61,25 +60,6 @@ class MetadataStore:
 
         logger.debug(
             "DICOM metadata table initialized"
-        )
-
-    def _init_PDF(self):
-        self.sqlite.execute("""
-            CREATE TABLE IF NOT EXISTS pdf_metadata (
-                file_id TEXT PRIMARY KEY,
-                patient_id TEXT,
-                gender TEXT,
-                age TEXT,
-                gestational_age TEXT,
-                bmi TEXT,
-                storage_key TEXT
-            )
-        """)
-
-        self.sqlite.commit()
-
-        logger.debug(
-            "PDF metadata table initialized"
         )
 
     def store_DICOM_metadata(self,deid_records):
@@ -142,35 +122,6 @@ class MetadataStore:
         logger.info(
             "DICOM metadata committed | records=%d",
             stored_count,
-        )
-
-    def store_PDF_metadata(self,file_id,metadata,storage_key):
-        self.sqlite.execute("""
-            INSERT OR REPLACE INTO pdf_metadata (
-                file_id,
-                patient_id,
-                gender,
-                age,
-                gestational_age,
-                bmi,
-                storage_key
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,(
-            file_id,
-            metadata["patient_id"],
-            metadata["gender"],
-            metadata["age"],
-            metadata["gestational_age"],
-            metadata["bmi"],
-            storage_key,
-        ))
-
-        self.sqlite.commit()
-
-        logger.info(
-            "PDF metadata committed | file=%s",
-            file_id,
         )
 
     def __enter__(self):

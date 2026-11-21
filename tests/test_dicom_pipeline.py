@@ -9,16 +9,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import cv2
-import nibabel as nib
 import numpy as np
 import pydicom
-import pymupdf
 import yaml
 from minio import Minio
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, MRImageStorage, generate_uid
 
-from src.ETL.dicom_dataset import order_slices
+from src.ETL.series import order_slices
 from src.ETL.dicom_preprocess import RejectedDicom, sanitize_DICOM
 from src.ETL.utils.HMAC_builder import deterministic_uid
 
@@ -33,7 +31,7 @@ def phantom(index):
     return pixels, mask.astype(np.uint8)
 
 
-def dicom_slice(series, position, study=None, frame=None):
+def dicom_slice(series, position, study=None, frame=None, patient_id="SYNTHETIC-123"):
     file_meta = FileMetaDataset()
     file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
     file_meta.MediaStorageSOPClassUID = MRImageStorage
@@ -44,7 +42,7 @@ def dicom_slice(series, position, study=None, frame=None):
     image.StudyInstanceUID = study or generate_uid()
     image.SeriesInstanceUID = series
     image.FrameOfReferenceUID = frame or generate_uid()
-    image.PatientID = "SYNTHETIC-123"
+    image.PatientID = patient_id
     image.PatientName = "Synthetic^Subject"
     image.InstitutionName = "Synthetic Hospital"
     image.SeriesDescription = "Synthetic identifying free text"
@@ -97,7 +95,7 @@ class DicomSafetyTests(unittest.TestCase):
 
 @unittest.skipUnless(os.getenv("GLIA_TEST_S3") == "1", "Set GLIA_TEST_S3=1 and configure a test S3 server")
 class PipelineTests(unittest.TestCase):
-    def test_trained_checkpoint_predicts_sanitized_dicom_series(self):
+    def test_train_on_dicom_and_predict_sanitized_series(self):
         bucket = f"glia-test-{generate_uid().split('.')[-1][:20]}"
         env = os.environ | {
             "HMAC_SECRET": TEST_SECRET,
@@ -125,62 +123,73 @@ class PipelineTests(unittest.TestCase):
             env["XDG_CACHE_HOME"] = str(work / "cache")
             env["MPLCONFIGDIR"] = str(work / "cache" / "matplotlib")
 
-            def run(*args, module="src.main", expected_status=0):
+            def run(*args, expected_status=0):
                 result = subprocess.run(
-                    [sys.executable, "-m", module, *args],
+                    [sys.executable, "-m", "src.main", *args],
                     cwd=work, env=env, text=True, capture_output=True, timeout=120,
                 )
                 self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
-                return result.stdout
+                return result.stdout + result.stderr
 
             cfg = yaml.safe_load((ROOT / "config.yaml").read_text())
             cfg["preprocessing"]["image_size"] = 32
             cfg["training"].update(epochs=1, batch_size=16, num_workers=0)
             cfg["model"]["features"] = [4, 8]
             cfg["inference"]["checkpoint"] = "checkpoints/synthetic.pth"
-            cfg["paths"]["metadata"] = "custom/training.csv"
-            (work / "config.yaml").write_text(yaml.safe_dump(cfg))
-            pixels, masks = (np.stack(parts, axis=-1) for parts in zip(*(phantom(index) for index in range(3))))
-            for index in range(2):
-                subject = work / "data" / "raw" / f"synthetic-{index}"
-                subject.mkdir(parents=True)
-                nib.save(nib.Nifti1Image(pixels, np.eye(4)), subject / "flair.nii.gz")
-                nib.save(nib.Nifti1Image(masks, np.eye(4)), subject / "seg.nii.gz")
-            self.assertIn("Samples: 3", run("train"))
-            self.assertTrue((work / cfg["inference"]["checkpoint"]).is_file())
-
-            # File names and InstanceNumber disagree with physical slice order.
-            raw = work / "data" / "DICOMs"
-            raw.mkdir(parents=True)
-            series, study, frame = generate_uid(), generate_uid(), generate_uid()
-            images = [dicom_slice(series, index, study, frame) for index in range(3)]
-            extra = dicom_slice(generate_uid(), 0, study, frame)
-            for label, image in zip(("c.dcm", "a.dcm", "b.dcm", "d.DICOM"), [*images, extra]):
-                image.save_as(raw / label, enforce_file_format=True)
+            cfg["paths"].update(predictions="dicom/predictions", overlays="dicom/overlays")
+            config = work / "config.yaml"
+            config.write_text(yaml.safe_dump(cfg))
             etl_cfg = work / "clinical.yaml"
             etl_cfg.write_text((ROOT / "config" / "config.yaml").read_text())
 
-            cfg["paths"].update(predictions="dicom/predictions", overlays="dicom/overlays")
-            (work / "config.yaml").write_text(yaml.safe_dump(cfg))
-            self.assertNotIn("Mean Dice", run("dicom", "--etl-config", str(etl_cfg)))
+            # Two patients are required for a patient-level validation split.
+            # The first patient has two series and non-geometric filenames.
+            raw = work / "data/DICOMs"
+            labels = work / cfg["paths"]["masks"]
+            series, study, frame = generate_uid(), generate_uid(), generate_uid()
+            images = [dicom_slice(series, index, study, frame) for index in range(3)]
+            extra = dicom_slice(generate_uid(), 0, study, frame)
+            other_series, other_study, other_frame = generate_uid(), generate_uid(), generate_uid()
+            other = [
+                dicom_slice(other_series, index, other_study, other_frame, patient_id="SYNTHETIC-456")
+                for index in range(3)
+            ]
+            for filename, image, position in zip(
+                ("first/c.dcm", "first/a.dcm", "first/b.dcm", "first/d.DICOM",
+                 "second/a.dcm", "second/b.dcm", "second/c.dcm"),
+                [*images, extra, *other],
+                [0, 1, 2, 0, 0, 1, 2],
+                strict=True,
+            ):
+                path = raw / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                image.save_as(path, enforce_file_format=True)
+                label = labels / (filename + ".png")
+                label.parent.mkdir(parents=True, exist_ok=True)
+                self.assertTrue(cv2.imwrite(str(label), phantom(position)[1] * 255))
+
+            training = run("train", "--etl-config", str(etl_cfg))
+            self.assertIn("V-Dice", training)
+            self.assertRegex(training, r"Training on 1 patients \([34] slices\), validating on 1 patients")
+            checkpoint = work / cfg["inference"]["checkpoint"]
+            self.assertGreater(checkpoint.stat().st_size, 0)
+            with sqlite3.connect(work / "output/metadata.db") as db:
+                rows = db.execute("SELECT storage_key FROM dicom_metadata").fetchall()
+            self.assertEqual(len(rows), 7)
+
+            # Inference reads the same input layout without labels.
+            labels.rename(work / "unused-labels")
+            self.assertNotIn("V-Dice", run("inference", "--etl-config", str(etl_cfg)))
             with (work / "dicom/predictions/dicom_predictions.csv").open() as stream:
                 report = list(csv.DictReader(stream))
-            self.assertEqual(len(report), 4)
+            self.assertEqual(len(report), 7)
             with patch.dict(os.environ, {"HMAC_SECRET": TEST_SECRET}):
                 clean_series = deterministic_uid(series, "series")
                 expected = [deterministic_uid(image.SOPInstanceUID, "sop") for image in images]
             series_rows = [row for row in report if row["series_uid"] == clean_series]
             self.assertEqual([row["sop_uid"] for row in series_rows], expected)
             self.assertEqual([row["slice_index"] for row in series_rows], ["0", "1", "2"])
-            self.assertEqual(len({row["series_uid"] for row in report}), 2)
-            for index, entry in enumerate(series_rows):
-                expected_mask, = (work / "data/inference_out/predictions").glob(f"*_slice{index:04d}_pred.png")
-                np.testing.assert_array_equal(
-                    cv2.imread(str(work / entry["prediction"]), cv2.IMREAD_GRAYSCALE),
-                    cv2.imread(str(expected_mask), cv2.IMREAD_GRAYSCALE),
-                )
-            with sqlite3.connect(work / "output/metadata.db") as db:
-                rows = db.execute("SELECT storage_key FROM dicom_metadata").fetchall()
+            self.assertEqual(len({row["series_uid"] for row in report}), 3)
             self.assertEqual({row[0] for row in rows}, {entry["storage_key"] for entry in report})
 
             for entry in report:
@@ -188,31 +197,18 @@ class PipelineTests(unittest.TestCase):
                 client.fget_object(bucket, entry["storage_key"], str(local))
                 clean = pydicom.dcmread(local)
                 self.assertFalse(clean.PatientName)
-                self.assertNotEqual(clean.PatientID, "SYNTHETIC-123")
+                self.assertNotIn("SeriesDescription", clean)
+                self.assertNotIn(clean.PatientID, {"SYNTHETIC-123", "SYNTHETIC-456"})
                 self.assertEqual(clean.SOPInstanceUID, entry["sop_uid"])
-                self.assertEqual(cv2.imread(str(work / entry["prediction"]), cv2.IMREAD_GRAYSCALE).shape, (32, 32))
+                mask = cv2.imread(str(work / entry["prediction"]), cv2.IMREAD_GRAYSCALE)
+                self.assertEqual(mask.shape, (32, 32))
+                self.assertTrue(np.isin(mask, [0, 255]).all())
                 self.assertEqual(cv2.imread(str(work / entry["overlay"])).shape, (32, 32, 3))
                 local.unlink()
 
-            (raw / "c.dcm").rename(raw / "duplicate.dcm")
-            images[0].save_as(raw / "c.dcm", enforce_file_format=True)
+            images[0].save_as(raw / "first/duplicate.dcm", enforce_file_format=True)
             cfg["paths"]["predictions"] = "rejected/predictions"
-            (work / "config.yaml").write_text(yaml.safe_dump(cfg))
-            log = run("dicom", "--etl-config", str(etl_cfg), expected_status=1)
+            config.write_text(yaml.safe_dump(cfg))
+            log = run("inference", "--etl-config", str(etl_cfg), expected_status=1)
             self.assertIn("Duplicate SOPInstanceUID", log)
             self.assertFalse((work / cfg["paths"]["predictions"]).exists())
-
-            (raw / "duplicate.dcm").unlink()
-            pdf = work / "data/PDFs/synthetic.pdf"
-            pdf.parent.mkdir()
-            with pymupdf.open() as document:
-                document.new_page().insert_text((72, 72), "Patient ID : SYNTHETIC-123")
-                document.save(pdf)
-            run("--config", str(etl_cfg), module="src.ETL.main")
-            with sqlite3.connect(work / "output/metadata.db") as db:
-                patient, key = db.execute("SELECT patient_id, storage_key FROM pdf_metadata").fetchone()
-                patients = db.execute("SELECT DISTINCT patient_id FROM dicom_metadata").fetchall()
-            self.assertEqual(patients, [(patient,)])
-            client.fget_object(bucket, key, str(work / "sanitized.pdf"))
-            with pymupdf.open(work / "sanitized.pdf") as document:
-                self.assertNotIn("SYNTHETIC-123", document[0].get_text())

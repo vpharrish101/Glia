@@ -1,5 +1,4 @@
 from pathlib import Path
-import yaml
 import logging
 import random
 import time
@@ -11,15 +10,13 @@ import segmentation_models_pytorch as smp
 
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from src.ETL.dataclass import BraTS_Dataset,train_trf,val_trf
-from src.unet_arch import UNet,count_parameters
-from src.utils.metrics import dice_coefficient,iou_score
+from sklearn.model_selection import train_test_split
+
+from src.Axion.dataset import SliceDataset
+from src.Axion.unet_arch import UNet, count_parameters
+from src.Axion.utils.metrics import dice_coefficient, iou_score
 
 logger=logging.getLogger(__name__)
-
-def load_config(p):
-    with open(p) as stream:
-        return yaml.safe_load(stream)
 
 def set_seed(s):
     random.seed(s);np.random.seed(s);torch.manual_seed(s)
@@ -90,35 +87,33 @@ def run_epoch(model,
     return {k: v/n for k,v in total.items()}
 
 
-def train(config_path: str):
+def train(cfg, scans):
+    tr, pp, mp = cfg["training"], cfg["preprocessing"], cfg["model"]
+    set_seed(tr["seed"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Device: %s", device)
 
-    cfg=load_config(config_path)
-    logging.basicConfig(level="INFO",format="%(asctime)s | %(message)s")
-    set_seed(cfg["training"]["seed"])
-
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
-
-    tr,pp,mp,paths=cfg["training"],cfg["preprocessing"],cfg["model"],cfg["paths"]
-    checkpoint_path = Path(cfg.get("inference", {}).get("checkpoint") or Path(paths["checkpoints"]) / "best.pth")
+    checkpoint_path = Path(cfg["inference"]["checkpoint"])
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     use_amp = device.type == "cuda" and tr["mixed_precision"]
     pin_memory = device.type == "cuda" and tr["pin_memory"]
     if tr["epochs"] < 1 or tr["gradient_accumulation_steps"] < 1:
         raise ValueError("Training needs at least one epoch and a positive gradient accumulation interval")
 
-    train_ds=BraTS_Dataset(paths["train_images"],
-                           paths["train_masks"],
-                           train_trf(pp["image_size"],mp["in_channels"]),
-                           paths["metadata"],"train")
-    
-    val_ds=BraTS_Dataset(paths["val_images"],
-                         paths["val_masks"],
-                         val_trf(pp["image_size"],mp["in_channels"]),
-                         paths["metadata"],"val")
+    scans = list(scans)
+    patients = sorted({scan.patient_id for scan in scans})
+    if len(patients) < 2:
+        raise ValueError("Training needs labeled DICOM slices from at least two distinct patients")
+    if any(scan.masks is None for scan in scans):
+        raise ValueError("Training requires a mask for every DICOM slice")
 
-    if not len(train_ds) or not len(val_ds):
-        raise ValueError("Training and validation each need labeled slices")
+    train_patients, val_patients = train_test_split(patients, test_size=pp["val_split"], random_state=tr["seed"])
+    train_ds = SliceDataset((scan for scan in scans if scan.patient_id in train_patients), cfg, augment=True)
+    val_ds = SliceDataset((scan for scan in scans if scan.patient_id in val_patients), cfg)
+    logger.info(
+        "Training on %d patients (%d slices), validating on %d patients (%d slices)",
+        len(train_patients), len(train_ds), len(val_patients), len(val_ds),
+    )
     train_loader = DataLoader(train_ds, tr["batch_size"], True, num_workers=tr["num_workers"], pin_memory=pin_memory)
     val_loader = DataLoader(val_ds, tr["batch_size"], False, num_workers=tr["num_workers"], pin_memory=pin_memory)
 
@@ -146,13 +141,14 @@ def train(config_path: str):
             scheduler.step(val["dice"])
             print(
                 f"E{epoch:03d} | "
-                f"T-Dice {trn['dice']:.4f} | V-Dice {val['dice']:.4f} | "
+                f"T-Dice {trn['dice']:.4f} | V-Dice {val['dice']:.4f} | V-IoU {val['iou']:.4f} | "
                 f"LR {optimizer.param_groups[0]['lr']:.5f} | "
-                f"{time.time()-t0:.1f}s")\
+                f"{time.time()-t0:.1f}s")
                 
             mlflow.log_metrics({
                 "train_dice": trn["dice"],
                 "val_dice": val["dice"],
+                "val_iou": val["iou"],
                 "train_loss": trn["loss"],
                 "val_loss": val["loss"],
                 "lr": optimizer.param_groups[0]["lr"],},step=epoch)
@@ -169,4 +165,4 @@ def train(config_path: str):
 
         mlflow.log_metric("best_val_dice",best_dice)
         logger.info(f"Best Dice: {best_dice:.4f}")
-
+    logger.info("Checkpoint saved to %s", checkpoint_path)

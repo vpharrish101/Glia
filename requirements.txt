@@ -5,12 +5,10 @@ minio==7.2.20
 mlflow==3.10.0
 mlflow_skinny==3.10.0
 mlflow_tracing==3.10.0
-nibabel==5.4.2
 numpy==2.4.4
 opencv_python_headless==4.13.0.92
 pandas==2.3.3
 pydicom==3.0.2
-pymupdf==1.28.2
 python-dotenv==1.2.2
 PyYAML==6.0.3
 scikit_learn==1.8.0

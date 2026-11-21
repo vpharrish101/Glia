@@ -13,4 +13,4 @@ COPY src ./src
 COPY config ./config
 COPY config.yaml .
 
-CMD ["python","-m","src.main"]
+CMD ["python","-m","src.main","inference"]

@@ -1,68 +1,75 @@
+"""Connect DICOM ETL to Axion training and inference."""
+
 import argparse
+import csv
 import logging
 from pathlib import Path
 
-logger = logging.getLogger("Glia.Orchestrator")
+import yaml
+from dotenv import load_dotenv
 
-
-def _run_dicom(config_path, etl_config_path):
-    import os
-
-    import torch
-    from dotenv import load_dotenv
-
-    from src.ETL.Metadata_db import MetadataStore
-    from src.ETL.Object_storage import DataLake
-    from src.ETL.main import ingest_dicoms
-    from src.ETL.preprocessing import context_slices
-    from src.ETL.utils.load_config import load_cfg
-    from src.inference import load_config, load_model, run_dicom_inference
-
-    load_dotenv()
-    if not os.getenv("HMAC_SECRET"):
-        raise ValueError("HMAC_SECRET must be set for DICOM ingestion")
-    cfg = load_config(config_path)
-    etl_cfg = load_cfg(etl_config_path)
-    if not Path(etl_cfg["Input_dirs"]["DICOM_dir"]).is_dir():
-        raise ValueError("The configured DICOM input directory does not exist")
-    context_slices(cfg)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(cfg["inference"]["checkpoint"], cfg, device)
-
-    lake = DataLake()
-    with MetadataStore(etl_cfg["database"]["metadata_path"]) as store:
-        records = ingest_dicoms(etl_cfg, store, lake)
-    if not records:
-        raise ValueError("No .dcm or .dicom files found in the DICOM input directory")
-    if any(record["status"] == "error" for record in records):
-        raise ValueError("DICOM ingestion rejected one or more inputs. See the ingestion log before retrying.")
-    if any(record["modality"] != "MR" for record in records):
-        raise ValueError("Segmentation expects MR series compatible with the checkpoint. Use clinical ETL for CT.")
-    run_dicom_inference(cfg, model, device, lake, records)
+logger = logging.getLogger("Glia")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Glia segmentation pipeline")
-    parser.add_argument("mode", choices=("train", "dicom"), nargs="?", default="train")
-    parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--etl-config", default="config/config.yaml")
+    parser = argparse.ArgumentParser(description="Glia DICOM segmentation")
+    parser.add_argument("mode", choices=("train", "inference"))
+    parser.add_argument("--config", default="config.yaml", help="Axion configuration")
+    parser.add_argument("--etl-config", default="config/config.yaml", help="ETL configuration")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    load_dotenv()
+    cfg = yaml.safe_load(Path(args.config).read_text())
+    etl_cfg = yaml.safe_load(Path(args.etl_config).read_text())
+    logging.basicConfig(
+        level=cfg.get("logging", {}).get("level", "INFO"),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    from src.Axion.dataset import prepare_scan
+    from src.ETL.ingest import ingest_dicoms
+    from src.ETL.series import read_series
+
+    training = args.mode == "train"
+    mask_dir = Path(cfg["paths"].get("masks", "data/masks"))
+    manifest_rows = {}
+
+    def scans():
+        lake, records = ingest_dicoms(etl_cfg["Input_dirs"]["DICOM_dir"], etl_cfg["database"]["metadata_path"])
+        if any(record["modality"] != "MR" for record in records):
+            raise ValueError("Axion expects MR series compatible with the model")
+
+        for images, ordered in read_series(lake, records):
+            slice_ids = [record["sop_uid"] for record in ordered]
+            mask_paths = None
+            if training:
+                mask_paths = [mask_dir / (record["source_path"].as_posix() + ".png") for record in ordered]
+            else:
+                for index, record in enumerate(ordered):
+                    manifest_rows[record["sop_uid"]] = (
+                        record["study_uid"], record["series_uid"], record["sop_uid"], index, record["storage_key"],
+                    )
+            yield prepare_scan(ordered[0]["patient_id"], slice_ids, images, cfg["preprocessing"]["image_size"], mask_paths)
 
     try:
-        if args.mode == "dicom":
-            _run_dicom(args.config, args.etl_config)
-        else:
-            from src.ETL.preprocessing import run_etl
-            from src.inference import run_inference
-            from src.train import train
+        if training:
+            from src.Axion.train import train
 
-            run_etl(args.config)
-            train(args.config)
-            run_inference(args.config)
-    except Exception:
-        logger.exception("Pipeline failed")
-        raise SystemExit(1)
+            if not mask_dir.is_dir():
+                raise ValueError(f"Training requires a PNG mask for each DICOM slice under {mask_dir}")
+            train(cfg, scans())
+        else:
+            from src.Axion.inference import run_inference
+
+            predictions = run_inference(cfg, scans())
+            manifest = Path(cfg["paths"]["predictions"]) / "dicom_predictions.csv"
+            with manifest.open("w", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(("study_uid", "series_uid", "sop_uid", "slice_index", "storage_key", "prediction", "overlay"))
+                writer.writerows((*manifest_rows[uid], *paths) for uid, paths in predictions.items())
+            logger.info("Predicted %d DICOM slices. Manifest: %s", len(predictions), manifest)
+    except (OSError, ValueError) as error:
+        logger.error("%s", error)
+        raise SystemExit(1) from error
 
 
 if __name__ == "__main__":
