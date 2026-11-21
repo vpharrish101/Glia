@@ -8,7 +8,7 @@ from src.ETL.Object_storage import DataLake
 from src.ETL.dicom_preprocess import processDICOMBatch
 
 
-def ingest_dicoms(source_dir, metadata_path, num_workers=4):
+def ingest_dicoms(source_dir, metadata_path, num_workers=4, *, segmentation_paths=None):
     if not os.getenv("HMAC_SECRET"):
         raise ValueError("HMAC_SECRET must be set for DICOM ingestion")
     if not Path(source_dir).is_dir():
@@ -17,9 +17,9 @@ def ingest_dicoms(source_dir, metadata_path, num_workers=4):
         raise ValueError("etl.num_workers must be a non-negative integer")
 
     lake = DataLake()
-    records = processDICOMBatch(source_dir, lake, num_workers)
+    records = processDICOMBatch(source_dir, lake, num_workers, segmentation_paths=segmentation_paths)
     if not records:
-        raise ValueError("No .dcm or .dicom files found in the DICOM input directory")
+        raise ValueError("No DICOM image files found in the DICOM input directory")
     with MetadataStore(metadata_path) as store:
         store.store_DICOM_metadata(records)
     if any(record["status"] == "error" for record in records):

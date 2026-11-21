@@ -12,7 +12,17 @@ Glia combines DICOM ETL with Axion, a U-Net segmentation pipeline. Both commands
 
 Put classic single-frame monochrome MR slices under `data/DICOMs/`. Subdirectories are supported. Use the sequence and orientation the model expects, such as FLAIR. Slices are grouped by patient, study, and series using DICOM metadata. By default, Axion uses the previous, current, and next slice from the same series.
 
-For training, put one grayscale PNG mask per DICOM in `data/masks/`. Mirror the DICOM directory structure and append `.png` to its filename.
+For DICOM SEG training, put the scan slices and their SEG file together under `data/DICOMs/`. If the study arrives as a ZIP, extract it there first.
+
+```text
+data/DICOMs/patient-a/001.dcm
+data/DICOMs/patient-a/002.dcm
+data/DICOMs/patient-a/segmentation.dcm
+```
+
+Use one BINARY DICOM SEG per source series. Each mask frame must reference its source image and match the original pixel grid. If a SEG contains multiple segments, select one with `training.segment_number` in `config/config.yaml`. Empty frames can be omitted when the SEG explicitly lists those source slices. Training uses SEG labels for the full batch when SEG files are present. ETL matches their references to pseudonymized scan IDs in memory and only the sanitized scan objects are saved to S3.
+
+For PNG training, put one grayscale PNG per DICOM in `data/masks/`. Mirror the DICOM directory structure and append `.png` to its filename.
 
 ```text
 data/DICOMs/patient-a/001.dcm
@@ -38,7 +48,7 @@ Both commands read `config/config.yaml` for input and output paths, ETL and data
 
 ## Synthetic test
 
-The test creates two synthetic patients with DICOM slices and PNG masks, trains one epoch, and runs inference. It checks that the stored DICOMs are sanitized and the output slices are in physical order.
+The tests create two synthetic patients and exercise both DICOM SEG and PNG training, followed by inference. They check SEG-to-slice alignment, sanitized storage, and physical slice order.
 
 ```bash
 docker compose run --rm --build --entrypoint python -e GLIA_TEST_S3=1 \

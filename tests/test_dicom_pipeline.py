@@ -13,11 +13,13 @@ import numpy as np
 import pydicom
 import yaml
 from minio import Minio
-from pydicom.dataset import FileDataset, FileMetaDataset
-from pydicom.uid import ExplicitVRLittleEndian, MRImageStorage, generate_uid
+from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+from pydicom.pixels import pack_bits
+from pydicom.uid import ExplicitVRLittleEndian, MRImageStorage, SegmentationStorage, generate_uid
 
 from src.ETL.series import order_slices
 from src.ETL.dicom_preprocess import RejectedDicom, sanitize_DICOM
+from src.ETL.segmentation import read_segmentation_masks
 from src.ETL.utils.HMAC_builder import deterministic_uid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +61,60 @@ def dicom_slice(series, position, study=None, frame=None, patient_id="SYNTHETIC-
     return image
 
 
+def dicom_seg(sources, frame_sources, segment_numbers=None):
+    def item(**attrs):
+        result = Dataset()
+        result.update(attrs)
+        return result
+
+    def reference(image):
+        return item(ReferencedSOPClassUID=image.SOPClassUID, ReferencedSOPInstanceUID=image.SOPInstanceUID)
+
+    first = sources[0]
+    seg_uid = generate_uid()
+    file_meta = FileMetaDataset()
+    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    file_meta.MediaStorageSOPClassUID = SegmentationStorage
+    file_meta.MediaStorageSOPInstanceUID = seg_uid
+    seg = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
+    seg.SOPClassUID = SegmentationStorage
+    seg.SOPInstanceUID = seg_uid
+    seg.Modality = "SEG"
+    seg.PatientID = first.PatientID
+    seg.PatientName = first.PatientName
+    seg.StudyInstanceUID = first.StudyInstanceUID
+    seg.SeriesInstanceUID = generate_uid()
+    seg.FrameOfReferenceUID = first.FrameOfReferenceUID
+    seg.SegmentationType = "BINARY"
+    numbers = segment_numbers or [1] * len(frame_sources)
+    seg.SegmentSequence = [item(SegmentNumber=n, SegmentLabel=f"Target {n}") for n in sorted(set(numbers))]
+    seg.Rows = first.Rows
+    seg.Columns = first.Columns
+    seg.NumberOfFrames = len(frame_sources)
+    seg.PhotometricInterpretation = "MONOCHROME2"
+    seg.SamplesPerPixel = 1
+    seg.BitsAllocated = seg.BitsStored = 1
+    seg.HighBit = seg.PixelRepresentation = 0
+    seg.ReferencedSeriesSequence = [item(
+        SeriesInstanceUID=first.SeriesInstanceUID,
+        ReferencedInstanceSequence=[reference(image) for image in sources],
+    )]
+    seg.SharedFunctionalGroupsSequence = [item(
+        PlaneOrientationSequence=[item(ImageOrientationPatient=first.ImageOrientationPatient)],
+        PixelMeasuresSequence=[item(PixelSpacing=first.PixelSpacing, SliceThickness=2)],
+    )]
+    seg.PerFrameFunctionalGroupsSequence = [
+        item(
+            PlanePositionSequence=[item(ImagePositionPatient=image.ImagePositionPatient)],
+            SegmentIdentificationSequence=[item(ReferencedSegmentNumber=number)],
+            DerivationImageSequence=[item(SourceImageSequence=[reference(image)])],
+        )
+        for image, number in zip(frame_sources, numbers, strict=True)
+    ]
+    seg.PixelData = pack_bits(np.stack([image.pixel_array > 200 for image in frame_sources]).astype(np.uint8))
+    return seg
+
+
 class DicomSafetyTests(unittest.TestCase):
     @patch.dict(os.environ, {"HMAC_SECRET": TEST_SECRET})
     def test_sanitization_keeps_pixels_and_geometry(self):
@@ -93,9 +149,74 @@ class DicomSafetyTests(unittest.TestCase):
             order_slices([one, two])
 
 
+class SegmentationTests(unittest.TestCase):
+    def setUp(self):
+        secret = patch.dict(os.environ, {"HMAC_SECRET": TEST_SECRET})
+        secret.start()
+        self.addCleanup(secret.stop)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "mask.dcm"
+        series, study, frame = generate_uid(), generate_uid(), generate_uid()
+        self.images = [dicom_slice(series, index, study, frame) for index in range(3)]
+        self.records = []
+        for image in self.images:
+            clean = sanitize_DICOM(image)
+            self.records.append({
+                "sop_uid": clean.SOPInstanceUID, "study_uid": clean.StudyInstanceUID,
+                "patient_id": clean.PatientID, "frame_uid": clean.FrameOfReferenceUID,
+                "series_uid": clean.SeriesInstanceUID, "rows": clean.Rows, "columns": clean.Columns,
+                "image_position": clean.ImagePositionPatient, "image_orientation": clean.ImageOrientationPatient,
+                "pixel_spacing_values": clean.PixelSpacing,
+            })
+
+    def masks(self, seg, **kwargs):
+        seg.save_as(self.path, enforce_file_format=True)
+        return read_segmentation_masks([self.path], self.records, **kwargs)
+
+    def test_matches_reversed_frames_and_explicit_empty_slice(self):
+        seg = dicom_seg(self.images, [self.images[2], self.images[0]])
+        masks = self.masks(seg)
+        for index in (0, 2):
+            np.testing.assert_array_equal(masks[self.records[index]["sop_uid"]], phantom(index)[1])
+        self.assertFalse(masks[self.records[1]["sop_uid"]].any())
+
+        del seg.ReferencedSeriesSequence
+        masks = self.masks(seg)
+        self.assertNotIn(self.records[1]["sop_uid"], masks)
+
+    def test_rejects_unknown_reference_and_shifted_geometry(self):
+        seg = dicom_seg(self.images, [self.images[0]])
+        frame = seg.PerFrameFunctionalGroupsSequence[0]
+        reference = frame.DerivationImageSequence[0].SourceImageSequence[0]
+        original_uid = reference.ReferencedSOPInstanceUID
+        reference.ReferencedSOPInstanceUID = generate_uid()
+        with self.assertRaisesRegex(ValueError, "absent from this batch"):
+            self.masks(seg)
+
+        reference.ReferencedSOPInstanceUID = original_uid
+        frame.PlanePositionSequence[0].ImagePositionPatient = [0, 0, 2]
+        with self.assertRaisesRegex(ValueError, "ImagePositionPatient does not match"):
+            self.masks(seg)
+
+    def test_requires_explicit_segment_for_multiple_labels(self):
+        seg = dicom_seg(self.images, [self.images[0], self.images[1]], [1, 2])
+        with self.assertRaisesRegex(ValueError, "training.segment_number"):
+            self.masks(seg)
+        masks = self.masks(seg, segment_number=2)
+        self.assertFalse(masks[self.records[0]["sop_uid"]].any())
+        np.testing.assert_array_equal(masks[self.records[1]["sop_uid"]], phantom(1)[1])
+
+
 @unittest.skipUnless(os.getenv("GLIA_TEST_S3") == "1", "Set GLIA_TEST_S3=1 and configure a test S3 server")
 class PipelineTests(unittest.TestCase):
-    def test_train_on_dicom_and_predict_sanitized_series(self):
+    def test_train_with_png_masks_and_predict(self):
+        self._train_and_predict(use_seg=False)
+
+    def test_train_with_dicom_seg_and_predict(self):
+        self._train_and_predict(use_seg=True)
+
+    def _train_and_predict(self, use_seg):
         bucket = f"glia-test-{generate_uid().split('.')[-1][:20]}"
         env = os.environ | {
             "HMAC_SECRET": TEST_SECRET,
@@ -167,9 +288,15 @@ class PipelineTests(unittest.TestCase):
                 path = raw / filename
                 path.parent.mkdir(parents=True, exist_ok=True)
                 image.save_as(path, enforce_file_format=True)
-                label = labels / (filename + ".png")
-                label.parent.mkdir(parents=True, exist_ok=True)
-                self.assertTrue(cv2.imwrite(str(label), phantom(position)[1] * 255))
+                if not use_seg:
+                    label = labels / (filename + ".png")
+                    label.parent.mkdir(parents=True, exist_ok=True)
+                    self.assertTrue(cv2.imwrite(str(label), phantom(position)[1] * 255))
+
+            if use_seg:
+                for index, series_images in enumerate([images, [extra], other]):
+                    seg = dicom_seg(series_images, list(reversed(series_images)))
+                    seg.save_as(raw / f"labels-{index}.dcm", enforce_file_format=True)
 
             training = run("train")
             self.assertIn("V-Dice", training)
@@ -182,7 +309,9 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(rows), 7)
 
             # Inference reads the same input layout without labels.
-            labels.rename(work / "unused-labels")
+            if not use_seg:
+                labels.rename(work / "unused-labels")
+            # Inference ignores SEG files even when left beside the images.
             inference_config = config.rename(work / "inference.yaml")
             self.assertNotIn("V-Dice", run("inference", "--config", str(inference_config)))
             with (work / "dicom/predictions/dicom_predictions.csv").open() as stream:
@@ -196,6 +325,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual([row["slice_index"] for row in series_rows], ["0", "1", "2"])
             self.assertEqual(len({row["series_uid"] for row in report}), 3)
             self.assertEqual({row[0] for row in rows}, {entry["storage_key"] for entry in report})
+            self.assertEqual({item.object_name for item in client.list_objects(bucket, recursive=True)}, {row[0] for row in rows})
 
             for entry in report:
                 local = work / "download.dcm"

@@ -26,35 +26,54 @@ def main():
 
     from src.Axion.dataset import prepare_scan
     from src.ETL.ingest import ingest_dicoms
+    from src.ETL.segmentation import read_segmentation_masks
     from src.ETL.series import read_series
 
     training = args.mode == "train"
-    mask_dir = Path(paths["masks"])
     manifest_rows = {}
 
     def scans():
-        lake, records = ingest_dicoms(paths["dicom"], paths["metadata_db"], cfg["etl"]["num_workers"])
+        segmentation_paths = [] if training else None
+        lake, records = ingest_dicoms(
+            paths["dicom"], paths["metadata_db"], cfg["etl"]["num_workers"], segmentation_paths=segmentation_paths,
+        )
         if any(record["modality"] != "MR" for record in records):
             raise ValueError("Axion expects MR series compatible with the model")
+
+        seg_masks = None
+        mask_dir = None
+        if segmentation_paths:
+            seg_masks = read_segmentation_masks(segmentation_paths, records, cfg["training"].get("segment_number"))
+            unlabeled = {record["sop_uid"] for record in records} - seg_masks.keys()
+            if unlabeled:
+                raise ValueError(f"DICOM SEG does not label {len(unlabeled)} input slices")
+        elif training:
+            mask_dir = Path(paths["masks"])
+            if not mask_dir.is_dir():
+                raise ValueError(f"Training requires DICOM SEG or a PNG mask for each slice under {mask_dir}")
 
         for images, ordered in read_series(lake, records):
             slice_ids = [record["sop_uid"] for record in ordered]
             mask_paths = None
-            if training:
+            mask_pixels = None
+            if seg_masks is not None:
+                mask_pixels = [seg_masks.pop(uid) for uid in slice_ids]
+            elif mask_dir is not None:
                 mask_paths = [mask_dir / (record["source_path"].as_posix() + ".png") for record in ordered]
             else:
                 for index, record in enumerate(ordered):
                     manifest_rows[record["sop_uid"]] = (
                         record["study_uid"], record["series_uid"], record["sop_uid"], index, record["storage_key"],
                     )
-            yield prepare_scan(ordered[0]["patient_id"], slice_ids, images, cfg["preprocessing"]["image_size"], mask_paths)
+            yield prepare_scan(
+                ordered[0]["patient_id"], slice_ids, images, cfg["preprocessing"]["image_size"],
+                mask_paths, mask_pixels=mask_pixels,
+            )
 
     try:
         if training:
             from src.Axion.train import train
 
-            if not mask_dir.is_dir():
-                raise ValueError(f"Training requires a PNG mask for each DICOM slice under {mask_dir}")
             train(cfg, scans())
         else:
             from src.Axion.inference import run_inference

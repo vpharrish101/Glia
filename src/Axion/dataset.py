@@ -17,15 +17,17 @@ class Scan:
     masks: np.ndarray | None = None
 
 
-def prepare_scan(patient_id, slice_ids, images, image_size, mask_paths=None):
+def prepare_scan(patient_id, slice_ids, images, image_size, mask_paths=None, *, mask_pixels=None):
     target_size = (image_size, image_size)
     masks = None
-    if mask_paths is not None:
+    labels = mask_paths if mask_paths is not None else mask_pixels
+    if labels is not None:
         mask_slices = []
-        for slice_id, path in zip(slice_ids, mask_paths, strict=True):
-            if not path.is_file():
-                raise ValueError(f"Missing PNG mask for slice {slice_id}")
-            mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        for slice_id, mask in zip(slice_ids, labels, strict=True):
+            if mask_paths is not None:
+                if not mask.is_file():
+                    raise ValueError(f"Missing PNG mask for slice {slice_id}")
+                mask = cv2.imread(str(mask), cv2.IMREAD_UNCHANGED)
             if mask is None or mask.shape != images.shape[:2]:
                 raise ValueError(f"Mask for slice {slice_id} must be grayscale and match the DICOM pixel grid")
             mask_slices.append(cv2.resize((mask > 0).astype(np.uint8), target_size, interpolation=cv2.INTER_NEAREST))

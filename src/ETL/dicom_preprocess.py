@@ -10,7 +10,7 @@ import pydicom
 from deid.config import DeidRecipe
 from deid.dicom.pixels.detect import has_burned_pixels
 from pydicom.dataset import FileDataset, FileMetaDataset
-from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, MRImageStorage, UID
+from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, MRImageStorage, SegmentationStorage, UID
 
 from src.ETL.Object_storage import DataLake
 from src.ETL.utils.HMAC_builder import deterministic_uid, patient_hmac
@@ -134,6 +134,11 @@ def processDICOM(source_file, lake=None):
             "study_uid": clean.StudyInstanceUID,
             "series_uid": clean.SeriesInstanceUID,
             "sop_uid": clean.SOPInstanceUID,
+            # Kept in memory for alignment with training annotations.
+            "frame_uid": clean.get("FrameOfReferenceUID"),
+            "image_position": clean.get("ImagePositionPatient"),
+            "image_orientation": clean.get("ImageOrientationPatient"),
+            "pixel_spacing_values": clean.get("PixelSpacing"),
             "manufacturer": None,
             "manufacturer_model": None,
             "body_part": None,
@@ -162,24 +167,31 @@ def _process_in_worker(path):
     return processDICOM(path, _worker_lake)
 
 
-def processDICOMBatch(source_dir, lake, num_workers=4):
+def processDICOMBatch(source_dir, lake, num_workers=4, *, segmentation_paths=None):
     source_dir = Path(source_dir)
-    paths = sorted(
+    candidates = sorted(
         path for path in source_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in {".dcm", ".dicom"}
     )
-    logger.info("DICOM files discovered: %d", len(paths))
     # Reject duplicate object identities before workers can upload the same key.
     seen_sops = set()
-    for path in paths:
+    paths = []
+    for path in candidates:
         try:
-            header = pydicom.dcmread(path, stop_before_pixels=True, specific_tags=["SOPInstanceUID"])
+            header = pydicom.dcmread(path, stop_before_pixels=True, specific_tags=["SOPClassUID", "SOPInstanceUID"])
         except (OSError, ValueError, EOFError, pydicom.errors.InvalidDicomError):
+            paths.append(path)
             continue  # The processing pass reports unreadable files.
+        if header.get("SOPClassUID") == SegmentationStorage:
+            if segmentation_paths is not None:
+                segmentation_paths.append(path)
+            continue
         uid = str(header.get("SOPInstanceUID", ""))
         if uid and uid in seen_sops:
             raise RejectedDicom("Duplicate SOPInstanceUID in this batch")
         seen_sops.add(uid)
+        paths.append(path)
+    logger.info("DICOM image files discovered: %d", len(paths))
 
     if num_workers > 1 and len(paths) > 1:
         with ProcessPoolExecutor(
