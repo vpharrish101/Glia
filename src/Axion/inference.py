@@ -44,7 +44,7 @@ def run_inference(cfg, scans):
             overlay_dir.mkdir(parents=True, exist_ok=True)
             loader = DataLoader(
                 SliceDataset([scan], cfg), batch_size=cfg["inference"]["batch_size"],
-                pin_memory=device.type == "cuda",
+                num_workers=cfg["inference"].get("num_workers", 2), pin_memory=device.type == "cuda",
             )
             for batch in tqdm(loader, desc="Inference"):
                 images = batch["image"].to(device, non_blocking=True)

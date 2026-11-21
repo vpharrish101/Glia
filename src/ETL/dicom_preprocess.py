@@ -1,6 +1,8 @@
 """Prepare single-frame monochrome DICOM images for the data lake."""
 
+from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
+from multiprocessing import get_context
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -15,6 +17,7 @@ from src.ETL.utils.HMAC_builder import deterministic_uid, patient_hmac
 from src.ETL.utils.logging_mod import get_logger
 
 logger = get_logger("DICOM")
+_worker_lake = None
 SUPPORTED_STORAGE = {MRImageStorage: "MR", CTImageStorage: "CT"}
 PIXEL_RECIPE = Path(__file__).resolve().parents[2] / "config" / "deid.dicom"
 # Keep the numeric image geometry and acquisition fields used by readers.
@@ -111,12 +114,10 @@ def sanitize_DICOM(source):
     return clean
 
 
-def processDICOM(source_file, lake=None, seen_sops=None):
+def processDICOM(source_file, lake=None):
     try:
         clean = sanitize_DICOM(pydicom.dcmread(source_file))
         sop_uid = clean.SOPInstanceUID
-        if seen_sops is not None and sop_uid in seen_sops:
-            raise RejectedDicom("Duplicate SOPInstanceUID in this batch")
         if lake is None:
             lake = DataLake()
         object_name = f"{clean.PatientID}_{sop_uid}.dcm"
@@ -124,9 +125,6 @@ def processDICOM(source_file, lake=None, seen_sops=None):
             path = Path(directory) / object_name
             clean.save_as(path, enforce_file_format=True)
             storage_key = lake.put(path, f"dicom/{object_name}")
-        if seen_sops is not None:
-            seen_sops.add(sop_uid)
-
         return {
             "filename": object_name,
             "patient_id": clean.PatientID,
@@ -154,21 +152,49 @@ def processDICOM(source_file, lake=None, seen_sops=None):
         return {"status": "error", "reason": f"DICOM read, decode or storage failed ({type(error).__name__})"}
 
 
-def processDICOMBatch(source_dir, lake):
+def _initialize_worker():
+    global _worker_lake
+    # The parent has already prepared the bucket. Each process owns its client.
+    _worker_lake = DataLake(ensure_bucket=False)
+
+
+def _process_in_worker(path):
+    return processDICOM(path, _worker_lake)
+
+
+def processDICOMBatch(source_dir, lake, num_workers=4):
     source_dir = Path(source_dir)
     paths = sorted(
         path for path in source_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in {".dcm", ".dicom"}
     )
     logger.info("DICOM files discovered: %d", len(paths))
-    records = []
+    # Reject duplicate object identities before workers can upload the same key.
     seen_sops = set()
-    for index, path in enumerate(paths, start=1):
-        record = processDICOM(path, lake, seen_sops)
+    for path in paths:
+        try:
+            header = pydicom.dcmread(path, stop_before_pixels=True, specific_tags=["SOPInstanceUID"])
+        except (OSError, ValueError, EOFError, pydicom.errors.InvalidDicomError):
+            continue  # The processing pass reports unreadable files.
+        uid = str(header.get("SOPInstanceUID", ""))
+        if uid and uid in seen_sops:
+            raise RejectedDicom("Duplicate SOPInstanceUID in this batch")
+        seen_sops.add(uid)
+
+    if num_workers > 1 and len(paths) > 1:
+        with ProcessPoolExecutor(
+            max_workers=min(num_workers, len(paths)),
+            mp_context=get_context("spawn"),
+            initializer=_initialize_worker,
+        ) as executor:
+            records = list(executor.map(_process_in_worker, paths))
+    else:
+        records = [processDICOM(path, lake) for path in paths]
+
+    for index, (path, record) in enumerate(zip(paths, records), start=1):
         if record["status"] == "error":
             logger.warning("DICOM input %d rejected: %s", index, record["reason"])
         else:
             # Keep the source path in memory only so the caller can match input labels.
             record["source_path"] = path.relative_to(source_dir)
-        records.append(record)
     return records

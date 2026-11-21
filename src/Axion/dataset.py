@@ -54,16 +54,18 @@ class SliceDataset(Dataset):
 
         transforms = []
         if augment:
+            aug = cfg.get("augmentation", {})
             transforms.extend([
-                A.HorizontalFlip(p=0.474),
-                A.VerticalFlip(p=0.645),
-                A.RandomRotate90(p=0.5),
-                A.ShiftScaleRotate(
-                    shift_limit=0.05, scale_limit=0.1, rotate_limit=15,
-                    border_mode=cv2.BORDER_CONSTANT, p=0.5,
-                ),
-                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
-                A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+                A.HorizontalFlip(p=aug.get("horizontal_flip_p", 0.474)),
+                A.VerticalFlip(p=aug.get("vertical_flip_p", 0.645)),
+                A.RandomRotate90(p=aug.get("rotate_90_p", 0.5)),
+                A.ShiftScaleRotate(border_mode=cv2.BORDER_CONSTANT, **aug.get(
+                    "shift_scale_rotate", {"shift_limit": 0.05, "scale_limit": 0.1, "rotate_limit": 15, "p": 0.5},
+                )),
+                A.RandomBrightnessContrast(**aug.get(
+                    "brightness_contrast", {"brightness_limit": 0.2, "contrast_limit": 0.2, "p": 0.3},
+                )),
+                A.GaussianBlur(**aug.get("gaussian_blur", {"blur_limit": (3, 5), "p": 0.2})),
             ])
         self.transform = A.Compose([
             *transforms,

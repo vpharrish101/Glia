@@ -120,8 +120,13 @@ def train(cfg, scans):
     model=UNet(mp["in_channels"],mp["out_channels"],mp["features"]).to(device)
     logger.info(f"Params: {count_parameters(model):,}")
 
-    optimizer=torch.optim.Adam(model.parameters(),lr=tr["learning_rate"],weight_decay=1e-5)  # pyright: ignore[reportPrivateImportUsage]
-    scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode="max",factor=0.5,patience=5)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=tr["learning_rate"], weight_decay=tr.get("weight_decay", 1e-5),
+    )
+    schedule = tr.get("lr_scheduler", {})
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=schedule.get("factor", 0.5), patience=schedule.get("patience", 5),
+    )
     scaler=torch.amp.GradScaler("cuda",enabled=use_amp) # pyright: ignore[reportAttributeAccessIssue]
 
     mlflow.set_tracking_uri(cfg.get("mlflow",{}).get("tracking_uri","./mlruns"))

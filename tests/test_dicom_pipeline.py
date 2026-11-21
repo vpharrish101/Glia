@@ -133,18 +133,20 @@ class PipelineTests(unittest.TestCase):
 
             cfg = yaml.safe_load((ROOT / "config.yaml").read_text())
             cfg["preprocessing"]["image_size"] = 32
-            cfg["training"].update(epochs=1, batch_size=16, num_workers=0)
+            cfg["training"].update(epochs=1, batch_size=16, learning_rate=0.0001, num_workers=0)
+            cfg["etl"]["num_workers"] = 2
             cfg["model"]["features"] = [4, 8]
             cfg["inference"]["checkpoint"] = "checkpoints/synthetic.pth"
-            cfg["paths"].update(predictions="dicom/predictions", overlays="dicom/overlays")
+            cfg["paths"].update(
+                dicom="incoming/dicom", masks="annotations", metadata_db="metadata/index.db",
+                predictions="dicom/predictions", overlays="dicom/overlays",
+            )
             config = work / "config.yaml"
             config.write_text(yaml.safe_dump(cfg))
-            etl_cfg = work / "clinical.yaml"
-            etl_cfg.write_text((ROOT / "config" / "config.yaml").read_text())
 
             # Two patients are required for a patient-level validation split.
             # The first patient has two series and non-geometric filenames.
-            raw = work / "data/DICOMs"
+            raw = work / cfg["paths"]["dicom"]
             labels = work / cfg["paths"]["masks"]
             series, study, frame = generate_uid(), generate_uid(), generate_uid()
             images = [dicom_slice(series, index, study, frame) for index in range(3)]
@@ -168,18 +170,19 @@ class PipelineTests(unittest.TestCase):
                 label.parent.mkdir(parents=True, exist_ok=True)
                 self.assertTrue(cv2.imwrite(str(label), phantom(position)[1] * 255))
 
-            training = run("train", "--etl-config", str(etl_cfg))
+            training = run("train")
             self.assertIn("V-Dice", training)
+            self.assertIn("LR 0.00010", training)
             self.assertRegex(training, r"Training on 1 patients \([34] slices\), validating on 1 patients")
             checkpoint = work / cfg["inference"]["checkpoint"]
             self.assertGreater(checkpoint.stat().st_size, 0)
-            with sqlite3.connect(work / "output/metadata.db") as db:
+            with sqlite3.connect(work / cfg["paths"]["metadata_db"]) as db:
                 rows = db.execute("SELECT storage_key FROM dicom_metadata").fetchall()
             self.assertEqual(len(rows), 7)
 
             # Inference reads the same input layout without labels.
             labels.rename(work / "unused-labels")
-            self.assertNotIn("V-Dice", run("inference", "--etl-config", str(etl_cfg)))
+            self.assertNotIn("V-Dice", run("inference"))
             with (work / "dicom/predictions/dicom_predictions.csv").open() as stream:
                 report = list(csv.DictReader(stream))
             self.assertEqual(len(report), 7)
@@ -209,6 +212,6 @@ class PipelineTests(unittest.TestCase):
             images[0].save_as(raw / "first/duplicate.dcm", enforce_file_format=True)
             cfg["paths"]["predictions"] = "rejected/predictions"
             config.write_text(yaml.safe_dump(cfg))
-            log = run("inference", "--etl-config", str(etl_cfg), expected_status=1)
+            log = run("inference", expected_status=1)
             self.assertIn("Duplicate SOPInstanceUID", log)
             self.assertFalse((work / cfg["paths"]["predictions"]).exists())

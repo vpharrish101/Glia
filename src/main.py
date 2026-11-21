@@ -15,11 +15,17 @@ def main():
     parser = argparse.ArgumentParser(description="Glia DICOM segmentation")
     parser.add_argument("mode", choices=("train", "inference"))
     parser.add_argument("--config", default="config.yaml", help="Axion configuration")
-    parser.add_argument("--etl-config", default="config/config.yaml", help="ETL configuration")
+    parser.add_argument("--etl-config", help="Override DICOM and SQLite paths with a legacy ETL configuration")
     args = parser.parse_args()
     load_dotenv()
     cfg = yaml.safe_load(Path(args.config).read_text())
-    etl_cfg = yaml.safe_load(Path(args.etl_config).read_text())
+    paths = cfg["paths"]
+    dicom_dir = paths.get("dicom", "data/DICOMs")
+    metadata_path = paths.get("metadata_db", "output/metadata.db")
+    if args.etl_config:
+        etl_cfg = yaml.safe_load(Path(args.etl_config).read_text())
+        dicom_dir = etl_cfg["Input_dirs"]["DICOM_dir"]
+        metadata_path = etl_cfg["database"]["metadata_path"]
     logging.basicConfig(
         level=cfg.get("logging", {}).get("level", "INFO"),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -34,7 +40,7 @@ def main():
     manifest_rows = {}
 
     def scans():
-        lake, records = ingest_dicoms(etl_cfg["Input_dirs"]["DICOM_dir"], etl_cfg["database"]["metadata_path"])
+        lake, records = ingest_dicoms(dicom_dir, metadata_path, cfg.get("etl", {}).get("num_workers", 4))
         if any(record["modality"] != "MR" for record in records):
             raise ValueError("Axion expects MR series compatible with the model")
 

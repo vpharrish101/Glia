@@ -9,7 +9,7 @@ logger=get_logger("DataLake")
 
 
 class DataLake:
-    def __init__(self):
+    def __init__(self, ensure_bucket=True):
         required = ("MINIO_ENDPOINT", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "MINIO_BUCKET")
         missing = [name for name in required if not os.getenv(name)]
         if missing:
@@ -23,6 +23,8 @@ class DataLake:
         )
 
         self.bucket=os.getenv("MINIO_BUCKET")
+        if not ensure_bucket:
+            return
 
         logger.info(
             "Data lake connected | bucket=%s",
