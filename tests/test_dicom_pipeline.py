@@ -254,12 +254,16 @@ class PipelineTests(unittest.TestCase):
 
             cfg = yaml.safe_load((ROOT / "config" / "config.yaml").read_text())
             cfg["preprocessing"]["image_size"] = 32
-            cfg["training"].update(epochs=1, batch_size=16, learning_rate=0.0001, num_workers=0)
+            cfg["training"].update(
+                epochs=1, batch_size=16, learning_rate=0.0001,
+                num_workers=2 if use_seg else 0, prefetch_factor=1,
+            )
             cfg["etl"]["num_workers"] = 2
             cfg["model"]["features"] = [4, 8]
             cfg["inference"]["checkpoint"] = "checkpoints/synthetic.pth"
             cfg["paths"].update(
                 dicom="incoming/dicom", masks="annotations", metadata_db="metadata/index.db",
+                training_cache="training-cache",
                 predictions="dicom/predictions", overlays="dicom/overlays",
             )
             config = work / "config" / "config.yaml"
@@ -299,6 +303,8 @@ class PipelineTests(unittest.TestCase):
                     seg.save_as(raw / f"labels-{index}.dcm", enforce_file_format=True)
 
             training = run("train")
+            self.assertIn("Staged 1 training series on disk", training)
+            self.assertEqual(list((work / cfg["paths"]["training_cache"]).iterdir()), [])
             self.assertIn("V-Dice", training)
             self.assertIn("LR 0.00010", training)
             self.assertRegex(training, r"Training on 1 patients \([34] slices\), validating on 1 patients")

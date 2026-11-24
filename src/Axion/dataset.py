@@ -1,12 +1,17 @@
 """Prepare ordered image stacks for binary segmentation."""
 
+import logging
+from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 
 import albumentations as A
 import cv2
 import numpy as np
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -15,6 +20,28 @@ class Scan:
     slice_ids: list[str]
     images: np.ndarray  # height, width, slices
     masks: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class StagedScan:
+    patient_id: str
+    slice_ids: list[str]
+    images_path: Path
+    masks_path: Path
+
+
+def stage_training_scans(scans, directory):
+    for count, scan in enumerate(scans, start=1):
+        if scan.masks is None:
+            raise ValueError("Training requires a mask for every DICOM slice")
+        images_path = directory / f"images-{count}.npy"
+        masks_path = directory / f"masks-{count}.npy"
+        # Store complete slices contiguously for efficient random batch reads.
+        np.save(images_path, np.ascontiguousarray(np.moveaxis(scan.images, -1, 0)))
+        np.save(masks_path, np.ascontiguousarray(np.moveaxis(scan.masks, -1, 0)))
+        if count == 1 or count % 25 == 0:
+            logger.info("Staged %d training series on disk", count)
+        yield StagedScan(scan.patient_id, scan.slice_ids, images_path, masks_path)
 
 
 def prepare_scan(patient_id, slice_ids, images, image_size, mask_paths=None, *, mask_pixels=None):
@@ -75,21 +102,38 @@ class SliceDataset(Dataset):
             ToTensorV2(),
         ])
         self.samples = [(scan, index) for scan in scans for index in range(len(scan.slice_ids))]
+        self._mapped_arrays = OrderedDict()
 
     def __len__(self):
         return len(self.samples)
 
+    def _arrays(self, scan):
+        if isinstance(scan, Scan):
+            return scan.images, scan.masks
+        key = scan.images_path
+        arrays = self._mapped_arrays.pop(key, None)
+        if arrays is None:
+            arrays = (
+                np.load(key, mmap_mode="r").transpose(1, 2, 0),
+                np.load(scan.masks_path, mmap_mode="r").transpose(1, 2, 0),
+            )
+        self._mapped_arrays[key] = arrays
+        if len(self._mapped_arrays) > 4:
+            self._mapped_arrays.popitem(last=False)
+        return arrays
+
     def __getitem__(self, index):
         scan, center = self.samples[index]
-        blank = np.zeros(scan.images.shape[:2], dtype=np.uint8)
+        images, masks = self._arrays(scan)
+        blank = np.zeros(images.shape[:2], dtype=np.uint8)
         channels = [
-            scan.images[:, :, neighbor] if 0 <= neighbor < len(scan.slice_ids) else blank
+            images[:, :, neighbor] if 0 <= neighbor < len(scan.slice_ids) else blank
             for neighbor in range(center - self.context, center + self.context + 1)
         ]
         image = np.stack(channels, axis=-1)
         inputs = {"image": image}
-        if scan.masks is not None:
-            inputs["mask"] = scan.masks[:, :, center]
+        if masks is not None:
+            inputs["mask"] = masks[:, :, center].copy()
         sample = self.transform(**inputs)
         sample["image"] = sample["image"].float()
         if "mask" in sample:

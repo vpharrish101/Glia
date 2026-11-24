@@ -12,7 +12,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 
-from src.Axion.dataset import SliceDataset
+from src.Axion.dataset import Scan, SliceDataset
 from src.Axion.unet_arch import UNet, count_parameters
 from src.Axion.utils.metrics import dice_coefficient, iou_score
 
@@ -104,7 +104,7 @@ def train(cfg, scans):
     patients = sorted({scan.patient_id for scan in scans})
     if len(patients) < 2:
         raise ValueError("Training needs labeled DICOM slices from at least two distinct patients")
-    if any(scan.masks is None for scan in scans):
+    if any(isinstance(scan, Scan) and scan.masks is None for scan in scans):
         raise ValueError("Training requires a mask for every DICOM slice")
 
     train_patients, val_patients = train_test_split(patients, test_size=pp["val_split"], random_state=tr["seed"])
@@ -114,8 +114,15 @@ def train(cfg, scans):
         "Training on %d patients (%d slices), validating on %d patients (%d slices)",
         len(train_patients), len(train_ds), len(val_patients), len(val_ds),
     )
-    train_loader = DataLoader(train_ds, tr["batch_size"], True, num_workers=tr["num_workers"], pin_memory=pin_memory)
-    val_loader = DataLoader(val_ds, tr["batch_size"], False, num_workers=tr["num_workers"], pin_memory=pin_memory)
+    loader_options = {
+        "batch_size": tr["batch_size"],
+        "num_workers": tr["num_workers"],
+        "pin_memory": pin_memory,
+    }
+    if tr["num_workers"] > 0:
+        loader_options["prefetch_factor"] = tr.get("prefetch_factor", 2)
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_options)
+    val_loader = DataLoader(val_ds, **loader_options)
 
     model=UNet(mp["in_channels"],mp["out_channels"],mp["features"]).to(device)
     logger.info(f"Params: {count_parameters(model):,}")

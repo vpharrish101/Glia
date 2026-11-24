@@ -1,6 +1,7 @@
 paths:
   dicom: "data/DICOMs"
   masks: "data/masks"
+  training_cache: "data/.training-cache"
   metadata_db: "output/metadata.db"
   predictions: "data/inference_out/predictions"
   overlays: "data/inference_out/overlays"
@@ -24,6 +25,7 @@ training:
   epochs: 36
   num_workers: 4
   pin_memory: true
+  prefetch_factor: 2          # Batches prefetched per data-loading worker
   gradient_accumulation_steps: 2  # Number of batches per optimizer update
   mixed_precision: true
   seed: 74

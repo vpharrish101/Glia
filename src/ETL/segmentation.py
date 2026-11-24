@@ -1,10 +1,14 @@
 """Match binary DICOM SEG masks to sanitized single-frame image records."""
 
+import logging
+
 import numpy as np
 import pydicom
 from pydicom.uid import SegmentationStorage, UID
 
 from src.ETL.utils.HMAC_builder import deterministic_uid, patient_hmac
+
+logger = logging.getLogger(__name__)
 
 
 def _mapped_uid(value, namespace):
@@ -114,13 +118,12 @@ def _read_masks(seg, sources, segment_number):
     return masks
 
 
-def read_segmentation_masks(paths, records, segment_number=None):
-    """Return slice masks keyed by the same pseudonymous UID as the scan ETL."""
+def _iter_segmentation_masks(paths, records, segment_number):
     if segment_number is not None and (type(segment_number) is not int or segment_number < 1):
         raise ValueError("training.segment_number must be a positive integer")
 
     sources = {record["sop_uid"]: record for record in records}
-    masks = {}
+    seen = set()
     for index, path in enumerate(paths, start=1):
         try:
             labels = _read_masks(pydicom.dcmread(path), sources, segment_number)
@@ -128,7 +131,42 @@ def read_segmentation_masks(paths, records, segment_number=None):
             raise ValueError(f"DICOM SEG {index}: {error}") from error
         except (AttributeError, OSError, RuntimeError, pydicom.errors.InvalidDicomError) as error:
             raise ValueError(f"DICOM SEG {index} could not be read or decoded") from error
-        if masks.keys() & labels.keys():
+        if seen & labels.keys():
             raise ValueError(f"DICOM SEG {index} overlaps annotations from another SEG file")
-        masks.update(labels)
+        seen.update(labels)
+        yield labels
+
+
+def read_segmentation_masks(paths, records, segment_number=None):
+    """Return slice masks keyed by the same pseudonymous UID as the scan ETL."""
+    return {
+        uid: mask for labels in _iter_segmentation_masks(paths, records, segment_number)
+        for uid, mask in labels.items()
+    }
+
+
+def stage_segmentation_masks(paths, records, directory, segment_number=None):
+    """Decode and stage one SEG file at a time, keeping a lightweight UID index."""
+    index = {}
+    for count, labels in enumerate(_iter_segmentation_masks(paths, records, segment_number), start=1):
+        path = directory / f"seg-{count}.npy"
+        np.save(path, np.stack(list(labels.values())))
+        index.update((uid, (path, offset)) for offset, uid in enumerate(labels))
+        if count == 1 or count % 25 == 0 or count == len(paths):
+            logger.info("Prepared %d/%d DICOM SEG files", count, len(paths))
+    return index
+
+
+def take_staged_masks(index, slice_ids):
+    """Read the labels for one series and release their temporary disk files."""
+    files = {}
+    masks = []
+    for uid in slice_ids:
+        path, offset = index.pop(uid)
+        if path not in files:
+            files[path] = np.load(path)
+        masks.append(files[path][offset])
+    # Each SEG covers one source series, so these files have been consumed.
+    for path in files:
+        path.unlink()
     return masks

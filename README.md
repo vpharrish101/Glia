@@ -46,6 +46,8 @@ docker compose run --rm pipeline inference
 
 Both commands read `config/config.yaml` for input and output paths, ETL and data-loading workers, and model and training settings. Pass `--config` to use a different complete settings file. `training.learning_rate` is the optimizer update size, such as `0.0001`. `training.gradient_accumulation_steps` is the number of batches per update, such as `2`.
 
+Training stages one series at a time under `paths.training_cache`. The data loader reads those files on demand and prefetches `training.prefetch_factor` batches per worker. Allow disk space for one byte per prepared image pixel and one per mask pixel. The temporary run directory is removed when the process exits normally.
+
 ## Synthetic test
 
 The tests create two synthetic patients and exercise both DICOM SEG and PNG training, followed by inference. They check SEG-to-slice alignment, sanitized storage, and physical slice order.

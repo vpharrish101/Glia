@@ -4,6 +4,7 @@ import argparse
 import csv
 import logging
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import yaml
 from dotenv import load_dotenv
@@ -26,13 +27,13 @@ def main():
 
     from src.Axion.dataset import prepare_scan
     from src.ETL.ingest import ingest_dicoms
-    from src.ETL.segmentation import read_segmentation_masks
+    from src.ETL.segmentation import stage_segmentation_masks, take_staged_masks
     from src.ETL.series import read_series
 
     training = args.mode == "train"
     manifest_rows = {}
 
-    def scans():
+    def scans(cache=None):
         segmentation_paths = [] if training else None
         lake, records = ingest_dicoms(
             paths["dicom"], paths["metadata_db"], cfg["etl"]["num_workers"], segmentation_paths=segmentation_paths,
@@ -43,7 +44,9 @@ def main():
         seg_masks = None
         mask_dir = None
         if segmentation_paths:
-            seg_masks = read_segmentation_masks(segmentation_paths, records, cfg["training"].get("segment_number"))
+            seg_masks = stage_segmentation_masks(
+                segmentation_paths, records, cache, cfg["training"].get("segment_number"),
+            )
             unlabeled = {record["sop_uid"] for record in records} - seg_masks.keys()
             if unlabeled:
                 raise ValueError(f"DICOM SEG does not label {len(unlabeled)} input slices")
@@ -52,12 +55,14 @@ def main():
             if not mask_dir.is_dir():
                 raise ValueError(f"Training requires DICOM SEG or a PNG mask for each slice under {mask_dir}")
 
+        if training:
+            logger.info("Staging sanitized scans and masks on disk")
         for images, ordered in read_series(lake, records):
             slice_ids = [record["sop_uid"] for record in ordered]
             mask_paths = None
             mask_pixels = None
             if seg_masks is not None:
-                mask_pixels = [seg_masks.pop(uid) for uid in slice_ids]
+                mask_pixels = take_staged_masks(seg_masks, slice_ids)
             elif mask_dir is not None:
                 mask_paths = [mask_dir / (record["source_path"].as_posix() + ".png") for record in ordered]
             else:
@@ -72,9 +77,14 @@ def main():
 
     try:
         if training:
+            from src.Axion.dataset import stage_training_scans
             from src.Axion.train import train
 
-            train(cfg, scans())
+            cache_root = Path(paths.get("training_cache", "data/.training-cache"))
+            cache_root.mkdir(parents=True, exist_ok=True)
+            with TemporaryDirectory(prefix="run-", dir=cache_root) as directory:
+                cache = Path(directory)
+                train(cfg, stage_training_scans(scans(cache), cache))
         else:
             from src.Axion.inference import run_inference
 
