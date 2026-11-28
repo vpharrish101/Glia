@@ -99,17 +99,9 @@ The reason I split the project this way: -
 ```
 ---
 
-## Features: -
 
-- **Healthcare ETL** - DICOM/PDF ingestion, de-identification, patient pseudonymisation, UID handling, and metadata extraction.
-- **Medical Data Storage** - MinIO for imaging files and SQLite for associated metadata.
-- **ML Dataset Construction** - Medical image preprocessing, 2.5D sample generation, and subject-level train/validation splitting.
-- **Segmentation Pipeline** - U-Net training, inference, checkpointing, and Dice / IoU evaluation.
-- **Experiment Tracking** - MLflow for training runs, metrics, and model artifacts.
-- **Containerized Workflow** - Docker Compose for the pipeline environment and supporting services.
-  
 ## MLOps Design: -
-
+I've designed this project with the incorporation of MLOps design paradigm, such as: -
 - **Separate stages** - ETL, preprocessing, training and inference are separate parts of the pipeline.
 - **Configuration-driven** - paths and pipeline parameters are kept outside the main processing logic.
 - **Reusable preprocessing** - the processed dataset can be reused across multiple training runs.
